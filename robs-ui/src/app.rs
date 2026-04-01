@@ -58,6 +58,13 @@ pub struct RobsApp {
     stream_bitrate: u32,
     keyframe_interval: u32,
     recording_bitrate: u32,
+    video_encoder: String,
+    audio_encoder: String,
+    available_video_encoders: Vec<String>,
+    available_audio_encoders: Vec<String>,
+    nvenc_available: bool,
+    aac_available: bool,
+    ffmpeg_available: bool,
 }
 
 #[derive(Clone)]
@@ -136,6 +143,13 @@ impl RobsApp {
             stream_bitrate: 6000,
             keyframe_interval: 2,
             recording_bitrate: 10000,
+            video_encoder: "ffmpeg_h264".into(),
+            audio_encoder: "ffmpeg_aac".into(),
+            available_video_encoders: vec!["FFmpeg x264 (Software)".into()],
+            available_audio_encoders: vec!["FFmpeg AAC".into()],
+            nvenc_available: false,
+            aac_available: false,
+            ffmpeg_available: false,
         }
     }
 
@@ -415,8 +429,23 @@ impl RobsApp {
             ui.label("Stream Key:");
             ui.text_edit_singleline(&mut self.stream_key);
             ui.end_row();
-            ui.label("Encoder:");
-            ui.button("x264");
+            ui.label("Video Encoder:");
+            egui::ComboBox::from_id_salt("video_encoder")
+                .selected_text(&self.video_encoder)
+                .show_ui(ui, |ui| {
+                    for enc in &self.available_video_encoders {
+                        ui.selectable_value(&mut self.video_encoder, enc.clone(), enc);
+                    }
+                });
+            ui.end_row();
+            ui.label("Audio Encoder:");
+            egui::ComboBox::from_id_salt("audio_encoder")
+                .selected_text(&self.audio_encoder)
+                .show_ui(ui, |ui| {
+                    for enc in &self.available_audio_encoders {
+                        ui.selectable_value(&mut self.audio_encoder, enc.clone(), enc);
+                    }
+                });
             ui.end_row();
             ui.label("Bitrate:");
             ui.add(egui::Slider::new(&mut self.stream_bitrate, 1000..=20000).suffix(" kbps"));
@@ -430,6 +459,21 @@ impl RobsApp {
             ui.label("Preset:");
             ui.button("faster");
             ui.end_row();
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Encoder Status:").strong());
+            if self.ffmpeg_available {
+                ui.label(egui::RichText::new("FFmpeg OK").color(egui::Color32::GREEN));
+            } else {
+                ui.label(egui::RichText::new("FFmpeg not found").color(egui::Color32::RED));
+            }
+            if self.nvenc_available {
+                ui.label(egui::RichText::new("NVENC OK").color(egui::Color32::GREEN));
+            } else {
+                ui.label(egui::RichText::new("NVENC not available").color(egui::Color32::YELLOW));
+            }
         });
     }
 
@@ -446,7 +490,13 @@ impl RobsApp {
             ui.button("mp4");
             ui.end_row();
             ui.label("Encoder:");
-            ui.button("x264");
+            egui::ComboBox::from_id_salt("recording_encoder")
+                .selected_text(&self.video_encoder)
+                .show_ui(ui, |ui| {
+                    for enc in &self.available_video_encoders {
+                        ui.selectable_value(&mut self.video_encoder, enc.clone(), enc);
+                    }
+                });
             ui.end_row();
             ui.label("Bitrate:");
             ui.add(egui::Slider::new(&mut self.recording_bitrate, 1000..=50000).suffix(" kbps"));

@@ -58,6 +58,11 @@ ROBS is organized as a Rust workspace with modular crates:
 
 - Rust 1.75+ with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`)
 - Windows 10 or later
+- FFmpeg 6+ must be installed and available in your system PATH
+
+### FFmpeg Requirement
+
+ROBS requires a recent version of FFmpeg to be installed on your system. The encoding pipeline (x264, NVENC, AAC) depends on FFmpeg being available as a system command. Ensure `ffmpeg` is accessible from your command line before running ROBS.
 
 ### Setup
 
@@ -89,7 +94,10 @@ This is an early-stage project with a functional UI and core architecture in pla
 - Complete UI with all major panels and settings
 - Profile management system
 - Chat aggregation framework (simulated messages)
-- Encoder trait system with x264 preset configuration
+- FFmpeg-based video encoding (x264 software encoder)
+- NVIDIA NVENC hardware encoder (auto-detected)
+- AAC audio encoder
+- Encoder factory with availability detection
 - RTMP output structure with multi-destination support
 - Audio mixer with per-channel controls
 - Plugin loading architecture
