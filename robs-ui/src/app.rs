@@ -2,6 +2,7 @@ use eframe::egui;
 use parking_lot::RwLock;
 use robs_chat::aggregator::ChatAggregator;
 use robs_chat::message::{ChatEvent, UnifiedChatMessage};
+use robs_encoding::detect_encoders;
 use robs_outputs::FileOutput;
 use robs_profiles::profile::ProfileManager;
 use std::collections::VecDeque;
@@ -92,6 +93,41 @@ struct AudioChannel {
 
 impl RobsApp {
     pub fn new(_cc: &eframe::CreationContext) -> Self {
+        let detection = detect_encoders();
+
+        let mut video_encoders = Vec::new();
+        if detection.ffmpeg_available {
+            video_encoders.push("FFmpeg x264 (Software)".into());
+        }
+        if detection.nvenc_available {
+            video_encoders.push("NVIDIA NVENC H.264 (Hardware)".into());
+        }
+        if video_encoders.is_empty() {
+            video_encoders.push("None Available".into());
+        }
+
+        let mut audio_encoders = Vec::new();
+        if detection.aac_available {
+            audio_encoders.push("FFmpeg AAC".into());
+        }
+        if audio_encoders.is_empty() {
+            audio_encoders.push("None Available".into());
+        }
+
+        let video_encoder = if detection.nvenc_available {
+            "NVIDIA NVENC H.264 (Hardware)".into()
+        } else if detection.ffmpeg_available {
+            "FFmpeg x264 (Software)".into()
+        } else {
+            "None Available".into()
+        };
+
+        let audio_encoder = if detection.aac_available {
+            "FFmpeg AAC".into()
+        } else {
+            "None Available".into()
+        };
+
         Self {
             streaming: false,
             recording: false,
@@ -155,13 +191,13 @@ impl RobsApp {
             recording_bitrate: 10000,
             recording_path: String::new(),
             recording_format: "mp4".into(),
-            video_encoder: "ffmpeg_h264".into(),
-            audio_encoder: "ffmpeg_aac".into(),
-            available_video_encoders: vec!["FFmpeg x264 (Software)".into()],
-            available_audio_encoders: vec!["FFmpeg AAC".into()],
-            nvenc_available: false,
-            aac_available: false,
-            ffmpeg_available: false,
+            video_encoder,
+            audio_encoder,
+            available_video_encoders: video_encoders,
+            available_audio_encoders: audio_encoders,
+            nvenc_available: detection.nvenc_available,
+            aac_available: detection.aac_available,
+            ffmpeg_available: detection.ffmpeg_available,
             recording_file_output: None,
             recording_start_time: None,
             last_recording_path: String::new(),

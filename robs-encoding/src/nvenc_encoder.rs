@@ -55,9 +55,16 @@ impl NvencH264Encoder {
 
     pub fn is_available() -> bool {
         std::process::Command::new("ffmpeg")
-            .args(["-codecs"])
+            .args(["-encoders"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_nvenc"))
+            .map(|o| {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                combined.contains("h264_nvenc")
+            })
             .unwrap_or(false)
     }
 
