@@ -1,0 +1,16 @@
+[package]
+name = "robs-outputs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+robs-core.workspace = true
+robs-encoding.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+flume.workspace = true
+async-trait.workspace = true

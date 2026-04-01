@@ -1,0 +1,17 @@
+[package]
+name = "robs-plugins"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+robs-core.workspace = true
+robs-sources.workspace = true
+robs-encoding.workspace = true
+robs-outputs.workspace = true
+libloading = "0.8"
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true

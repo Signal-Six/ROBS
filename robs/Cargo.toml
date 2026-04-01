@@ -1,0 +1,29 @@
+[package]
+name = "robs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "robs"
+path = "src/main.rs"
+
+[dependencies]
+robs-core.workspace = true
+robs-video.workspace = true
+robs-audio.workspace = true
+robs-encoding.workspace = true
+robs-outputs.workspace = true
+robs-sources.workspace = true
+robs-ui.workspace = true
+robs-plugins.workspace = true
+robs-profiles.workspace = true
+robs-chat.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+eframe.workspace = true
+fastrand = "2.0"
+uuid.workspace = true
+chrono.workspace = true
