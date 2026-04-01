@@ -7,6 +7,8 @@ edition.workspace = true
 robs-core.workspace = true
 robs-profiles.workspace = true
 robs-chat.workspace = true
+robs-outputs.workspace = true
+robs-encoding.workspace = true
 eframe = { version = "0.29", features = ["default"] }
 egui = "0.29"
 tokio.workspace = true
@@ -15,3 +17,4 @@ tracing.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 chrono.workspace = true
+rfd = "0.15"

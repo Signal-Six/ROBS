@@ -2,8 +2,11 @@ use eframe::egui;
 use parking_lot::RwLock;
 use robs_chat::aggregator::ChatAggregator;
 use robs_chat::message::{ChatEvent, UnifiedChatMessage};
+use robs_outputs::FileOutput;
 use robs_profiles::profile::ProfileManager;
 use std::collections::VecDeque;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -29,6 +32,7 @@ pub struct RobsApp {
     scenes: Vec<String>,
     sources: Vec<SourceEntry>,
     show_settings: bool,
+    settings_rect: Option<egui::Rect>,
     active_settings_tab: usize,
     audio_channels: Vec<AudioChannel>,
     streaming_time: u64,
@@ -58,6 +62,8 @@ pub struct RobsApp {
     stream_bitrate: u32,
     keyframe_interval: u32,
     recording_bitrate: u32,
+    recording_path: String,
+    recording_format: String,
     video_encoder: String,
     audio_encoder: String,
     available_video_encoders: Vec<String>,
@@ -65,6 +71,9 @@ pub struct RobsApp {
     nvenc_available: bool,
     aac_available: bool,
     ffmpeg_available: bool,
+    recording_file_output: Option<FileOutput>,
+    recording_start_time: Option<u64>,
+    last_recording_path: String,
 }
 
 #[derive(Clone)]
@@ -98,6 +107,7 @@ impl RobsApp {
                 source_type: "test_pattern".to_string(),
             }],
             show_settings: false,
+            settings_rect: None,
             audio_channels: vec![
                 AudioChannel {
                     name: "Mic/Aux".into(),
@@ -143,6 +153,8 @@ impl RobsApp {
             stream_bitrate: 6000,
             keyframe_interval: 2,
             recording_bitrate: 10000,
+            recording_path: String::new(),
+            recording_format: "mp4".into(),
             video_encoder: "ffmpeg_h264".into(),
             audio_encoder: "ffmpeg_aac".into(),
             available_video_encoders: vec!["FFmpeg x264 (Software)".into()],
@@ -150,6 +162,9 @@ impl RobsApp {
             nvenc_available: false,
             aac_available: false,
             ffmpeg_available: false,
+            recording_file_output: None,
+            recording_start_time: None,
+            last_recording_path: String::new(),
         }
     }
 
@@ -174,6 +189,57 @@ impl RobsApp {
             self.streaming_time += 1;
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        if self.recording {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+    }
+
+    fn start_recording(&mut self) {
+        let path = if self.recording_path.is_empty() {
+            let default_dir = std::env::var("USERPROFILE")
+                .map(|p| format!("{}\\Videos", p))
+                .unwrap_or_else(|_| "C:\\Users\\Videos".to_string());
+            fs::create_dir_all(&default_dir).ok();
+            default_dir
+        } else {
+            self.recording_path.clone()
+        };
+
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+        let filename = format!("ROBS_{}.{}", timestamp, self.recording_format);
+        let full_path = PathBuf::from(&path).join(&filename);
+
+        self.last_recording_path = full_path.to_string_lossy().into_owned();
+
+        println!(
+            "[Recording] Starting recording to {}",
+            self.last_recording_path
+        );
+        self.recording = true;
+        self.recording_start_time = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+    }
+
+    fn stop_recording(&mut self) {
+        self.recording = false;
+        let elapsed = self.recording_start_time.map(|start| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                - start
+        });
+
+        let duration_str = elapsed.map(|s| Self::format_time(s)).unwrap_or_default();
+        println!(
+            "[Recording] Stopped recording ({}s) saved to {}",
+            duration_str, self.last_recording_path
+        );
+        self.recording_start_time = None;
     }
 
     fn format_time(seconds: u64) -> String {
@@ -279,7 +345,11 @@ impl RobsApp {
                     ))
                     .clicked()
                 {
-                    self.recording = !self.recording;
+                    if self.recording {
+                        self.stop_recording();
+                    } else {
+                        self.start_recording();
+                    }
                 }
 
                 ui.separator();
@@ -297,51 +367,64 @@ impl RobsApp {
     }
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
+        let mut show_settings = self.show_settings;
         egui::Window::new("Settings")
-            .collapsible(false)
+            .id(egui::Id::new("settings_window"))
             .resizable(true)
+            .open(&mut show_settings)
             .default_width(650.0)
             .default_height(450.0)
+            .min_width(400.0)
+            .min_height(300.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let settings_tabs = [
+                let available_height = ui.available_height();
+                ui.columns(2, |cols| {
+                    let left = &mut cols[0];
+                    left.set_min_width(120.0);
+                    left.set_max_width(160.0);
+                    for (i, tab) in [
                         "General",
                         "Video",
                         "Audio",
                         "Hotkeys",
                         "Streaming",
                         "Outputs",
-                    ];
-                    ui.vertical(|ui| {
-                        ui.set_width(130.0);
-                        for (i, tab) in settings_tabs.iter().enumerate() {
-                            let selected = self.active_settings_tab == i;
-                            if ui.selectable_label(selected, *tab).clicked() {
-                                self.active_settings_tab = i;
-                            }
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        if left
+                            .selectable_label(self.active_settings_tab == i, *tab)
+                            .clicked()
+                        {
+                            self.active_settings_tab = i;
                         }
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.set_max_width(400.0);
-                        match self.active_settings_tab {
-                            0 => self.settings_general(ui),
-                            1 => self.settings_video(ui),
-                            2 => self.settings_audio(ui),
-                            3 => self.settings_hotkeys(ui),
-                            4 => self.settings_streaming(ui),
-                            5 => self.settings_outputs(ui),
-                            _ => {}
-                        }
-                        ui.separator();
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Close").clicked() {
-                                self.show_settings = false;
+                    }
+
+                    let right = &mut cols[1];
+                    egui::ScrollArea::vertical()
+                        .max_height(available_height)
+                        .show(right, |ui| {
+                            ui.set_min_width(250.0);
+                            match self.active_settings_tab {
+                                0 => self.settings_general(ui),
+                                1 => self.settings_video(ui),
+                                2 => self.settings_audio(ui),
+                                3 => self.settings_hotkeys(ui),
+                                4 => self.settings_streaming(ui),
+                                5 => self.settings_outputs(ui),
+                                _ => {}
                             }
                         });
-                    });
+                });
+                ui.separator();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        self.show_settings = false;
+                    }
                 });
             });
+        self.show_settings = show_settings;
     }
 
     fn settings_general(&mut self, ui: &mut egui::Ui) {
@@ -487,7 +570,13 @@ impl RobsApp {
             ui.button("Standard");
             ui.end_row();
             ui.label("Format:");
-            ui.button("mp4");
+            egui::ComboBox::from_id_salt("recording_format")
+                .selected_text(&self.recording_format)
+                .show_ui(ui, |ui| {
+                    for fmt in ["mp4", "mkv", "flv", "mov"] {
+                        ui.selectable_value(&mut self.recording_format, fmt.to_string(), fmt);
+                    }
+                });
             ui.end_row();
             ui.label("Encoder:");
             egui::ComboBox::from_id_salt("recording_encoder")
@@ -500,6 +589,27 @@ impl RobsApp {
             ui.end_row();
             ui.label("Bitrate:");
             ui.add(egui::Slider::new(&mut self.recording_bitrate, 1000..=50000).suffix(" kbps"));
+            ui.end_row();
+            ui.label("Path:");
+            ui.horizontal(|ui| {
+                let display_path = if self.recording_path.is_empty() {
+                    "(not set)".to_string()
+                } else {
+                    self.recording_path.clone()
+                };
+                ui.label(display_path);
+                if ui.button("Browse...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_directory(
+                            std::env::var("USERPROFILE")
+                                .unwrap_or_else(|_| "C:\\Users".to_string()),
+                        )
+                        .pick_folder()
+                    {
+                        self.recording_path = path.to_string_lossy().into_owned();
+                    }
+                }
+            });
             ui.end_row();
         });
     }
