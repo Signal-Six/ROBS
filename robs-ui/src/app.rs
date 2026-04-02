@@ -593,6 +593,11 @@ impl RobsApp {
             } else {
                 ui.label(egui::RichText::new("NVENC not available").color(egui::Color32::YELLOW));
             }
+            if self.aac_available {
+                ui.label(egui::RichText::new("AAC OK").color(egui::Color32::GREEN));
+            } else {
+                ui.label(egui::RichText::new("AAC not available").color(egui::Color32::YELLOW));
+            }
         });
     }
 

@@ -45,7 +45,14 @@ impl FfmpegAacEncoder {
         std::process::Command::new("ffmpeg")
             .args(["-codecs"])
             .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("aac"))
+            .map(|o| {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                combined.contains("AAC")
+            })
             .unwrap_or(false)
     }
 }
