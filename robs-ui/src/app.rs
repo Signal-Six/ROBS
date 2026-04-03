@@ -99,6 +99,108 @@ fn get_monitors() -> Vec<MonitorInfo> {
     monitors
 }
 
+#[derive(Clone)]
+struct AudioDeviceInfo {
+    pub name: String,
+    pub id: String,
+    pub is_input: bool, // true = microphone/aux, false = desktop audio/speakers
+}
+
+fn get_audio_devices() -> Vec<AudioDeviceInfo> {
+    let mut devices = Vec::new();
+
+    // Add special options first
+    devices.push(AudioDeviceInfo {
+        name: "Disabled".to_string(),
+        id: "disabled".to_string(),
+        is_input: true,
+    });
+    devices.push(AudioDeviceInfo {
+        name: "Default".to_string(),
+        id: "default".to_string(),
+        is_input: true,
+    });
+
+    // Use FFmpeg to list DirectShow audio devices
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+
+        // Get audio input devices (microphones)
+        if let Ok(output) = Command::new("ffmpeg")
+            .args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let mut in_audio_section = false;
+
+            for line in stderr.lines() {
+                if line.contains("DirectShow audio devices") {
+                    in_audio_section = true;
+                    continue;
+                }
+
+                // Stop at video devices section
+                if line.contains("DirectShow video devices") {
+                    in_audio_section = false;
+                }
+
+                if in_audio_section && line.contains("(audio)") {
+                    // Parse device name from format: "Device Name" (audio)
+                    if let Some(start) = line.find("\"") {
+                        if let Some(end) = line[start + 1..].find("\"") {
+                            let name = &line[start + 1..start + 1 + end];
+                            // Skip device enumeration lines, keep actual device names
+                            if !name.contains("Device") && !name.is_empty() && name.len() > 2 {
+                                let id = format!("audio={}", name);
+                                devices.push(AudioDeviceInfo {
+                                    name: name.to_string(),
+                                    id: id.clone(),
+                                    is_input: true,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no devices found via FFmpeg, add known devices as fallback
+        if devices.len() <= 2 {
+            // Add GoXLR broadcast mix (system audio)
+            devices.push(AudioDeviceInfo {
+                name: "Broadcast Stream Mix (TC-HELICON GoXLR)".to_string(),
+                id: "audio=Broadcast Stream Mix (TC-HELICON GoXLR)".to_string(),
+                is_input: false, // This is system/desktop audio
+            });
+            // Add GoXLR chat mic
+            devices.push(AudioDeviceInfo {
+                name: "Chat Mic (TC-HELICON GoXLR)".to_string(),
+                id: "audio=Chat Mic (TC-HELICON GoXLR)".to_string(),
+                is_input: true,
+            });
+            // Add VB-Audio Virtual Cable
+            devices.push(AudioDeviceInfo {
+                name: "CABLE Output (VB-Audio Virtual Cable)".to_string(),
+                id: "audio=CABLE Output (VB-Audio Virtual Cable)".to_string(),
+                is_input: false,
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        devices.push(AudioDeviceInfo {
+            name: "Default".to_string(),
+            id: "default".to_string(),
+            is_input: true,
+        });
+    }
+
+    devices
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Panel {
     Preview,
@@ -155,8 +257,13 @@ pub struct RobsApp {
     recording_format: String,
     video_encoder: String,
     audio_encoder: String,
+    audio_sample_rate: String,  // "44100" or "48000"
+    audio_channel_mode: String, // "mono" or "stereo"
     available_video_encoders: Vec<String>,
     available_audio_encoders: Vec<String>,
+    // Audio devices
+    audio_devices: Vec<AudioDeviceInfo>,
+    selected_audio_device: String,
     nvenc_available: bool,
     aac_available: bool,
     ffmpeg_available: bool,
@@ -184,6 +291,8 @@ struct AudioChannel {
     name: String,
     volume: f32,
     muted: bool,
+    device_id: String, // device ID or "disabled" or "default"
+    is_desktop: bool,  // true = desktop audio, false = mic/aux
 }
 
 impl RobsApp {
@@ -240,16 +349,15 @@ impl RobsApp {
                     name: "Mic/Aux".into(),
                     volume: 0.8,
                     muted: false,
+                    device_id: "default".to_string(),
+                    is_desktop: false,
                 },
                 AudioChannel {
                     name: "Desktop Audio".into(),
                     volume: 0.6,
                     muted: false,
-                },
-                AudioChannel {
-                    name: "Application".into(),
-                    volume: 0.9,
-                    muted: false,
+                    device_id: "default".to_string(),
+                    is_desktop: true,
                 },
             ],
             streaming_time: 0,
@@ -284,8 +392,13 @@ impl RobsApp {
             recording_format: "mp4".into(),
             video_encoder,
             audio_encoder,
+            audio_sample_rate: "48000".to_string(),
+            audio_channel_mode: "stereo".to_string(),
             available_video_encoders: video_encoders,
             available_audio_encoders: audio_encoders,
+            // Audio devices
+            audio_devices: get_audio_devices(),
+            selected_audio_device: "0".to_string(),
             nvenc_available: detection.nvenc_available,
             aac_available: detection.aac_available,
             ffmpeg_available: detection.ffmpeg_available,
@@ -434,10 +547,60 @@ impl RobsApp {
         ffmpeg_args.push("-i".into());
         ffmpeg_args.push("desktop".into());
 
-        // Audio input - only add if audio encoder is configured
-        // Skip audio entirely to avoid FFmpeg crashes when virtual-audio-capture is unavailable
-        // Recording will be video-only
-        let _ = self.audio_encoder; // Mark as used to avoid unused warning
+        // Get desktop audio and mic/aux device settings
+        let desktop_audio_device = self
+            .audio_channels
+            .iter()
+            .find(|ch| ch.is_desktop)
+            .map(|ch| ch.device_id.clone())
+            .unwrap_or_else(|| "disabled".to_string());
+
+        let mic_audio_device = self
+            .audio_channels
+            .iter()
+            .find(|ch| !ch.is_desktop)
+            .map(|ch| ch.device_id.clone())
+            .unwrap_or_else(|| "disabled".to_string());
+
+        eprintln!("[Recording] Desktop audio device: {}", desktop_audio_device);
+        eprintln!("[Recording] Mic/Aux audio device: {}", mic_audio_device);
+
+        // Add desktop audio (system audio) if not disabled
+        // Map "default" to a valid device if needed
+        if desktop_audio_device != "disabled" {
+            let audio_input = if desktop_audio_device == "default" {
+                // Default: try to use GoXLR Broadcast Stream Mix
+                "audio=Broadcast Stream Mix (TC-HELICON GoXLR)".to_string()
+            } else if desktop_audio_device.starts_with("audio=") {
+                // Already has audio= prefix, use as-is
+                desktop_audio_device.clone()
+            } else {
+                // Add prefix if missing
+                format!("audio={}", desktop_audio_device)
+            };
+            eprintln!("[Recording] Using desktop audio input: {}", audio_input);
+            ffmpeg_args.push("-f".into());
+            ffmpeg_args.push("dshow".into());
+            ffmpeg_args.push("-i".into());
+            ffmpeg_args.push(audio_input);
+        }
+
+        // Add mic/aux audio if not disabled and different from desktop
+        if mic_audio_device != "disabled" && mic_audio_device != desktop_audio_device {
+            let audio_input = if mic_audio_device == "default" {
+                // Default: try to use GoXLR Chat Mic
+                "audio=Chat Mic (TC-HELICON GoXLR)".to_string()
+            } else if mic_audio_device.starts_with("audio=") {
+                mic_audio_device.clone()
+            } else {
+                format!("audio={}", mic_audio_device)
+            };
+            eprintln!("[Recording] Using mic audio input: {}", audio_input);
+            ffmpeg_args.push("-f".into());
+            ffmpeg_args.push("dshow".into());
+            ffmpeg_args.push("-i".into());
+            ffmpeg_args.push(audio_input);
+        }
 
         // Video codec
         ffmpeg_args.push("-c:v".into());
@@ -467,6 +630,24 @@ impl RobsApp {
             ffmpeg_args.push("zerolatency".into());
             ffmpeg_args.push("-crf".into());
             ffmpeg_args.push("23".into());
+        }
+
+        // Add audio codec if we have audio inputs
+        let has_audio = desktop_audio_device != "disabled" || mic_audio_device != "disabled";
+        if has_audio {
+            // Use AAC for audio encoding
+            ffmpeg_args.push("-c:a".into());
+            ffmpeg_args.push("aac".into());
+            ffmpeg_args.push("-b:a".into());
+            ffmpeg_args.push("192k".into());
+            // Sample rate
+            ffmpeg_args.push("-ar".into());
+            ffmpeg_args.push(self.audio_sample_rate.clone());
+            // Channel mode (mono/stereo)
+            if self.audio_channel_mode == "mono" {
+                ffmpeg_args.push("-ac".into());
+                ffmpeg_args.push("1".into());
+            }
         }
 
         // Frame rate
@@ -874,14 +1055,100 @@ impl RobsApp {
         ui.heading("Audio");
         ui.separator();
         egui::Grid::new("settings_audio").show(ui, |ui| {
+            // Sample rate selection
             ui.label("Sample Rate:");
-            ui.button("48kHz");
+            egui::ComboBox::from_id_salt("audio_sample_rate")
+                .selected_text(&self.audio_sample_rate)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.audio_sample_rate,
+                        "44100".to_string(),
+                        "44.1 kHz",
+                    );
+                    ui.selectable_value(&mut self.audio_sample_rate, "48000".to_string(), "48 kHz");
+                });
             ui.end_row();
+
+            // Channel mode selection
             ui.label("Channels:");
-            ui.button("Stereo");
+            egui::ComboBox::from_id_salt("audio_channel_mode")
+                .selected_text(if self.audio_channel_mode == "mono" {
+                    "Mono"
+                } else {
+                    "Stereo"
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.audio_channel_mode, "mono".to_string(), "Mono");
+                    ui.selectable_value(
+                        &mut self.audio_channel_mode,
+                        "stereo".to_string(),
+                        "Stereo",
+                    );
+                });
             ui.end_row();
-            ui.label("Monitoring Device:");
-            ui.button("Default");
+
+            // Desktop Audio device selection
+            ui.label("Desktop Audio:");
+            let desktop_device = self
+                .audio_channels
+                .iter()
+                .find(|ch| ch.is_desktop)
+                .map(|ch| ch.device_id.clone())
+                .unwrap_or_else(|| "default".to_string());
+
+            let mut selected_desktop = desktop_device.clone();
+            egui::ComboBox::from_id_salt("desktop_audio_device")
+                .selected_text(&selected_desktop)
+                .show_ui(ui, |ui| {
+                    for device in &self.audio_devices {
+                        let display_name = if device.id == "disabled" {
+                            "Disabled"
+                        } else if device.id == "default" {
+                            "Default"
+                        } else {
+                            &device.name
+                        };
+                        ui.selectable_value(&mut selected_desktop, device.id.clone(), display_name);
+                    }
+                });
+            // Update the device_id in audio_channels
+            for ch in &mut self.audio_channels {
+                if ch.is_desktop {
+                    ch.device_id = selected_desktop.clone();
+                }
+            }
+            ui.end_row();
+
+            // Mic/Aux device selection
+            ui.label("Mic/Aux:");
+            let mic_device = self
+                .audio_channels
+                .iter()
+                .find(|ch| !ch.is_desktop)
+                .map(|ch| ch.device_id.clone())
+                .unwrap_or_else(|| "default".to_string());
+
+            let mut selected_mic = mic_device.clone();
+            egui::ComboBox::from_id_salt("mic_aux_device")
+                .selected_text(&selected_mic)
+                .show_ui(ui, |ui| {
+                    for device in &self.audio_devices {
+                        let display_name = if device.id == "disabled" {
+                            "Disabled"
+                        } else if device.id == "default" {
+                            "Default"
+                        } else {
+                            &device.name
+                        };
+                        ui.selectable_value(&mut selected_mic, device.id.clone(), display_name);
+                    }
+                });
+            // Update the device_id in audio_channels
+            for ch in &mut self.audio_channels {
+                if !ch.is_desktop {
+                    ch.device_id = selected_mic.clone();
+                }
+            }
             ui.end_row();
         });
     }
@@ -976,12 +1243,21 @@ impl RobsApp {
                     }
                 });
             ui.end_row();
-            ui.label("Encoder:");
+            ui.label("Video Encoder:");
             egui::ComboBox::from_id_salt("recording_encoder")
                 .selected_text(&self.video_encoder)
                 .show_ui(ui, |ui| {
                     for enc in &self.available_video_encoders {
                         ui.selectable_value(&mut self.video_encoder, enc.clone(), enc);
+                    }
+                });
+            ui.end_row();
+            ui.label("Audio Encoder:");
+            egui::ComboBox::from_id_salt("audio_encoder")
+                .selected_text(&self.audio_encoder)
+                .show_ui(ui, |ui| {
+                    for enc in &self.available_audio_encoders {
+                        ui.selectable_value(&mut self.audio_encoder, enc.clone(), enc);
                     }
                 });
             ui.end_row();
