@@ -5,7 +5,30 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // Only enable ERROR level to eliminate TRACE noise
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .init();
+
+    println!("[DEBUG] ROBS starting...");
+    eprintln!("[DEBUG] ROBS starting (stderr)...");
+    
+    // Set up panic hook to capture any crashes
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        
+        let location = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        
+        eprintln!("[PANIC] {} at {}", msg, location);
+    }));
 
     println!(r#"
     ╔═════════════════════════════════════════╗

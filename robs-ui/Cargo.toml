@@ -18,3 +18,4 @@ parking_lot.workspace = true
 serde.workspace = true
 chrono.workspace = true
 rfd = "0.15"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }

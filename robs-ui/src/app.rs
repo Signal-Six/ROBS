@@ -2,14 +2,102 @@ use eframe::egui;
 use parking_lot::RwLock;
 use robs_chat::aggregator::ChatAggregator;
 use robs_chat::message::{ChatEvent, UnifiedChatMessage};
+use robs_core::traits::VideoSource;
 use robs_encoding::detect_encoders;
 use robs_outputs::FileOutput;
 use robs_profiles::profile::ProfileManager;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+#[derive(Clone)]
+struct MonitorInfo {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+    pub position_x: i32,
+    pub position_y: i32,
+}
+
+fn get_monitors() -> Vec<MonitorInfo> {
+    let mut monitors = Vec::new();
+
+    // Use Windows GDI to enumerate display monitors
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{LPARAM, RECT};
+        use windows::Win32::Graphics::Gdi::{
+            EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+        };
+
+        unsafe extern "system" fn enum_monitors(
+            hmonitor: HMONITOR,
+            _hdc: HDC,
+            _rect: *mut RECT,
+            lparam: LPARAM,
+        ) -> windows::Win32::Foundation::BOOL {
+            let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
+
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+
+            if GetMonitorInfoW(hmonitor, &mut info as *mut _ as *mut _).as_bool() {
+                let is_primary = (info.monitorInfo.dwFlags & 1) != 0;
+                let width = info.monitorInfo.rcMonitor.right - info.monitorInfo.rcMonitor.left;
+                let height = info.monitorInfo.rcMonitor.bottom - info.monitorInfo.rcMonitor.top;
+                let position_x = info.monitorInfo.rcMonitor.left;
+                let position_y = info.monitorInfo.rcMonitor.top;
+
+                let name = String::from_utf16_lossy(
+                    &info.szDevice[..info
+                        .szDevice
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(info.szDevice.len())],
+                );
+
+                monitors.push(MonitorInfo {
+                    name,
+                    width: width as u32,
+                    height: height as u32,
+                    is_primary,
+                    position_x,
+                    position_y,
+                });
+            }
+
+            windows::Win32::Foundation::BOOL(1)
+        }
+
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                None,
+                None,
+                Some(enum_monitors),
+                LPARAM(&mut monitors as *mut _ as isize),
+            );
+        }
+    }
+
+    // If no monitors found, provide a default
+    if monitors.is_empty() {
+        monitors.push(MonitorInfo {
+            name: "Display 1".to_string(),
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+            position_x: 0,
+            position_y: 0,
+        });
+    }
+
+    monitors
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Panel {
@@ -75,6 +163,11 @@ pub struct RobsApp {
     recording_file_output: Option<FileOutput>,
     recording_start_time: Option<u64>,
     last_recording_path: String,
+    ffmpeg_recording_handle: Option<std::process::Child>, // Store FFmpeg process handle for graceful shutdown
+    // Video capture
+    active_video_source: Option<Box<dyn VideoSource>>,
+    preview_texture: Option<egui::TextureHandle>,
+    frame_buffer: HashMap<String, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -82,6 +175,8 @@ struct SourceEntry {
     name: String,
     visible: bool,
     source_type: String,
+    capture_method: String, // "desktop", "window", "image", "video"
+    device_id: String,      // monitor index, window name, etc.
 }
 
 #[derive(Clone)]
@@ -137,11 +232,7 @@ impl RobsApp {
             chat_rx: None,
             current_scene: "Scene 1".to_string(),
             scenes: vec!["Scene 1".to_string()],
-            sources: vec![SourceEntry {
-                name: "Test Pattern".to_string(),
-                visible: true,
-                source_type: "test_pattern".to_string(),
-            }],
+            sources: vec![],
             show_settings: false,
             settings_rect: None,
             audio_channels: vec![
@@ -201,6 +292,10 @@ impl RobsApp {
             recording_file_output: None,
             recording_start_time: None,
             last_recording_path: String::new(),
+            ffmpeg_recording_handle: None,
+            active_video_source: None,
+            preview_texture: None,
+            frame_buffer: HashMap::new(),
         }
     }
 
@@ -231,6 +326,10 @@ impl RobsApp {
     }
 
     fn start_recording(&mut self) {
+        // Force stderr output to be visible
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(b"[Recording] start_recording() called\n");
+
         let path = if self.recording_path.is_empty() {
             let default_dir = std::env::var("USERPROFILE")
                 .map(|p| format!("{}\\Videos", p))
@@ -245,12 +344,191 @@ impl RobsApp {
         let filename = format!("ROBS_{}.{}", timestamp, self.recording_format);
         let full_path = PathBuf::from(&path).join(&filename);
 
+        // Create parent directory if needed
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+
         self.last_recording_path = full_path.to_string_lossy().into_owned();
 
-        println!(
-            "[Recording] Starting recording to {}",
-            self.last_recording_path
+        // Find the active monitor capture source and get device_id
+        eprintln!("[Recording] Looking for monitor_capture source...");
+        eprintln!("[Recording] Total sources: {}", self.sources.len());
+        for (i, s) in self.sources.iter().enumerate() {
+            eprintln!(
+                "[Recording] Source {}: name='{}' type='{}' visible={} device_id='{}'",
+                i, s.name, s.source_type, s.visible, s.device_id
+            );
+        }
+
+        let (input_spec, offset_x, offset_y, video_width, video_height) = self
+            .sources
+            .iter()
+            .find(|s| s.visible && s.source_type == "monitor_capture")
+            .map(|s| {
+                eprintln!(
+                    "[Recording] Found source: {} device_id={}",
+                    s.name, s.device_id
+                );
+
+                let device_id: u32 = s.device_id.parse().unwrap_or(0);
+
+                // Get monitor info for this device
+                let monitors = get_monitors();
+                eprintln!("[Recording] Total monitors available: {}", monitors.len());
+
+                let monitor = monitors.get(device_id as usize);
+
+                // Always use "desktop" - desktop@N doesn't work
+                let input = "desktop".to_string();
+
+                // Get offset and size from monitor
+                let (ox, oy, width, height) = monitor
+                    .map(|m| {
+                        eprintln!(
+                            "[Recording] Selected monitor: {} {}x{} at ({},{})",
+                            m.name, m.width, m.height, m.position_x, m.position_y
+                        );
+                        (m.position_x, m.position_y, m.width, m.height)
+                    })
+                    .unwrap_or((0, 0, 1920, 1080));
+                (input, ox, oy, width, height)
+            })
+            .unwrap_or_else(|| {
+                eprintln!("[Recording] No monitor_capture source found!");
+                ("desktop".to_string(), 0, 0, 1920, 1080)
+            });
+
+        eprintln!(
+            "[Recording] Using input: {} at offset ({}, {}) size {}x{}",
+            input_spec, offset_x, offset_y, video_width, video_height
         );
+
+        let output_path = self.last_recording_path.clone();
+
+        // Determine which encoder to use
+        let encoder =
+            if self.video_encoder.contains("NVENC") || self.video_encoder.contains("NVIDIA") {
+                "h264_nvenc"
+            } else {
+                "libx264"
+            };
+
+        // Build FFmpeg args based on format
+        let format = self.recording_format.clone();
+        let mut ffmpeg_args = Vec::new();
+
+        // Input: desktop capture with gdigrab
+        ffmpeg_args.push("-f".into());
+        ffmpeg_args.push("gdigrab".into());
+        ffmpeg_args.push("-framerate".into());
+        ffmpeg_args.push("30".into());
+        ffmpeg_args.push("-draw_mouse".into());
+        ffmpeg_args.push("1".into());
+        ffmpeg_args.push("-offset_x".into());
+        ffmpeg_args.push(offset_x.to_string());
+        ffmpeg_args.push("-offset_y".into());
+        ffmpeg_args.push(offset_y.to_string());
+        ffmpeg_args.push("-video_size".into());
+        ffmpeg_args.push(format!("{}x{}", video_width, video_height));
+        ffmpeg_args.push("-i".into());
+        ffmpeg_args.push("desktop".into());
+
+        // Audio input - only add if audio encoder is configured
+        // Skip audio entirely to avoid FFmpeg crashes when virtual-audio-capture is unavailable
+        // Recording will be video-only
+        let _ = self.audio_encoder; // Mark as used to avoid unused warning
+
+        // Video codec
+        ffmpeg_args.push("-c:v".into());
+        ffmpeg_args.push(encoder.to_string());
+
+        // NVENC-specific settings
+        if encoder == "h264_nvenc" {
+            ffmpeg_args.push("-preset".into());
+            ffmpeg_args.push("p4".into());
+            ffmpeg_args.push("-tune".into());
+            ffmpeg_args.push("ll".into());
+            ffmpeg_args.push("-gpu".into());
+            ffmpeg_args.push("0".into());
+            ffmpeg_args.push("-rc".into());
+            ffmpeg_args.push("cbr".into());
+            ffmpeg_args.push("-b:v".into());
+            ffmpeg_args.push(format!("{}k", self.recording_bitrate));
+            ffmpeg_args.push("-maxrate".into());
+            ffmpeg_args.push(format!("{}k", self.recording_bitrate));
+            ffmpeg_args.push("-bufsize".into());
+            ffmpeg_args.push(format!("{}k", self.recording_bitrate * 2));
+        } else {
+            // x264 settings
+            ffmpeg_args.push("-preset".into());
+            ffmpeg_args.push("fast".into());
+            ffmpeg_args.push("-tune".into());
+            ffmpeg_args.push("zerolatency".into());
+            ffmpeg_args.push("-crf".into());
+            ffmpeg_args.push("23".into());
+        }
+
+        // Frame rate
+        ffmpeg_args.push("-r".into());
+        ffmpeg_args.push("30".into());
+
+        // Output format and overwrite
+        if format == "mp4" {
+            ffmpeg_args.push("-f".into());
+            ffmpeg_args.push("mp4".into());
+        } else if format == "mkv" {
+            ffmpeg_args.push("-f".into());
+            ffmpeg_args.push("matroska".into());
+        } else if format == "flv" {
+            ffmpeg_args.push("-f".into());
+            ffmpeg_args.push("flv".into());
+        }
+        ffmpeg_args.push("-y".into());
+        ffmpeg_args.push(output_path.clone());
+
+        eprintln!("[Recording] FFmpeg args: {:?}", ffmpeg_args);
+
+        // Spawn FFmpeg to capture the selected monitor
+        let ffmpeg_result = std::process::Command::new("ffmpeg")
+            .args(&ffmpeg_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        match ffmpeg_result {
+            Ok(mut child) => {
+                let pid = child.id();
+                eprintln!(
+                    "[Recording] FFmpeg started (PID: {}) capturing to {}",
+                    pid, output_path
+                );
+
+                // Try to read initial stderr output to check for errors
+                if let Some(stderr) = child.stderr.take() {
+                    use std::io::{BufRead, BufReader};
+                    let reader = BufReader::new(stderr);
+                    // Read first few lines of stderr
+                    let mut lines = Vec::new();
+                    for line in reader.lines().take(10) {
+                        if let Ok(l) = line {
+                            lines.push(l);
+                        }
+                    }
+                    if !lines.is_empty() {
+                        println!("[Recording] FFmpeg output: {}", lines.join("; "));
+                    }
+                }
+
+                // Store the handle for graceful shutdown
+                self.ffmpeg_recording_handle = Some(child);
+            }
+            Err(e) => {
+                println!("[Recording] Failed to start FFmpeg: {}", e);
+            }
+        }
+
         self.recording = true;
         self.recording_start_time = Some(
             std::time::SystemTime::now()
@@ -261,6 +539,61 @@ impl RobsApp {
     }
 
     fn stop_recording(&mut self) {
+        // Try graceful shutdown first - send 'q' to FFmpeg's stdin
+        if let Some(mut child) = self.ffmpeg_recording_handle.take() {
+            println!("[Recording] Requesting graceful FFmpeg shutdown...");
+
+            // Write 'q' to stdin to request graceful shutdown
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                if stdin.write_all(b"q").is_ok() {
+                    println!("[Recording] Sent quit command to FFmpeg");
+                }
+            }
+
+            // Wait for the process to exit (with timeout)
+            let timeout = std::time::Duration::from_secs(5);
+            let start = std::time::Instant::now();
+
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        println!("[Recording] FFmpeg exited with: {}", status);
+                        break;
+                    }
+                    Ok(None) => {
+                        if start.elapsed() > timeout {
+                            println!("[Recording] Timeout waiting for FFmpeg, forcing kill...");
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/IM", "ffmpeg.exe", "/F"])
+                                .output();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => {
+                        println!("[Recording] Error waiting for FFmpeg: {}", e);
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Fallback: use taskkill if no handle stored
+            println!("[Recording] No stored handle, using taskkill fallback...");
+            let _ = std::process::Command::new("taskkill")
+                .args(["/IM", "ffmpeg.exe", "/T", "/F"])
+                .output();
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            let _ = std::process::Command::new("taskkill")
+                .args(["/IM", "ffmpeg.exe", "/F"])
+                .output();
+        }
+
+        // Wait a bit more for file to be finalized
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
         self.recording = false;
         let elapsed = self.recording_start_time.map(|start| {
             std::time::SystemTime::now()
@@ -271,10 +604,34 @@ impl RobsApp {
         });
 
         let duration_str = elapsed.map(|s| Self::format_time(s)).unwrap_or_default();
-        println!(
-            "[Recording] Stopped recording ({}s) saved to {}",
-            duration_str, self.last_recording_path
-        );
+
+        // Verify file was created and has proper size
+        let file_exists = std::path::Path::new(&self.last_recording_path).exists();
+        if file_exists {
+            if let Ok(metadata) = fs::metadata(&self.last_recording_path) {
+                let size_mb = metadata.len() as f64 / 1_048_576.0;
+                println!(
+                    "[Recording] Stopped - saved to {} ({}s, {:.2} MB)",
+                    self.last_recording_path, duration_str, size_mb
+                );
+
+                // Check if file seems valid (has some size)
+                if size_mb < 0.01 {
+                    println!("[Recording] WARNING: File is very small, may not be playable");
+                }
+            } else {
+                println!(
+                    "[Recording] Stopped recording ({}s) saved to {}",
+                    duration_str, self.last_recording_path
+                );
+            }
+        } else {
+            println!(
+                "[Recording] Stopped ({}s) - WARNING: file not found at {}",
+                duration_str, self.last_recording_path
+            );
+        }
+
         self.recording_start_time = None;
     }
 
@@ -381,9 +738,15 @@ impl RobsApp {
                     ))
                     .clicked()
                 {
+                    eprintln!(
+                        "[Recording] Record button clicked! recording={}",
+                        self.recording
+                    );
                     if self.recording {
+                        eprintln!("[Recording] Calling stop_recording()");
                         self.stop_recording();
                     } else {
+                        eprintln!("[Recording] Calling start_recording()");
                         self.start_recording();
                     }
                 }
@@ -452,12 +815,6 @@ impl RobsApp {
                                 _ => {}
                             }
                         });
-                });
-                ui.separator();
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        self.show_settings = false;
-                    }
                 });
             });
         self.show_settings = show_settings;
@@ -685,7 +1042,7 @@ impl RobsApp {
     fn scenes_panel(&mut self, ctx: &egui::Context) {
         if self.show_scenes {
             egui::SidePanel::left("scenes_panel")
-                .default_width(200.0)
+                .default_width(250.0)
                 .resizable(true)
                 .show_animated(ctx, true, |ui| {
                     ui.heading("Scenes");
@@ -709,6 +1066,130 @@ impl RobsApp {
                             }
                         }
                     });
+
+                    // Show sources for current scene
+                    if self.current_scene == "Scene 1" {
+                        ui.separator();
+                        ui.heading("Sources");
+                        ui.separator();
+                        ui.menu_button("+ Add Source", |ui| {
+                            ui.menu_button("Display Capture", |ui| {
+                                // Get actual monitor info from Windows
+                                let monitors = get_monitors();
+
+                                if monitors.is_empty() {
+                                    ui.label("No monitors detected");
+                                    // Fallback to old behavior
+                                    for monitor_id in 0..2 {
+                                        let monitor_name = if monitor_id == 0 {
+                                            "Monitor 1 (Primary)"
+                                        } else {
+                                            "Monitor 2"
+                                        };
+                                        if ui.button(monitor_name).clicked() {
+                                            self.sources.push(SourceEntry {
+                                                name: format!(
+                                                    "Display Capture - Monitor {}",
+                                                    monitor_id + 1
+                                                ),
+                                                visible: true,
+                                                source_type: "monitor_capture".to_string(),
+                                                capture_method: "desktop".to_string(),
+                                                device_id: monitor_id.to_string(),
+                                            });
+                                            ui.close_menu();
+                                        }
+                                    }
+                                } else {
+                                    ui.label("Select Monitor:");
+                                    for (idx, monitor) in monitors.iter().enumerate() {
+                                        let label = if monitor.is_primary {
+                                            format!(
+                                                "{} ({}x{} - PRIMARY)",
+                                                monitor.name, monitor.width, monitor.height
+                                            )
+                                        } else {
+                                            format!(
+                                                "{} ({}x{} @ {},{})",
+                                                monitor.name,
+                                                monitor.width,
+                                                monitor.height,
+                                                monitor.position_x,
+                                                monitor.position_y
+                                            )
+                                        };
+                                        if ui.button(label).clicked() {
+                                            self.sources.push(SourceEntry {
+                                                name: format!(
+                                                    "Display Capture - {}",
+                                                    if monitor.is_primary {
+                                                        "Primary"
+                                                    } else {
+                                                        &monitor.name
+                                                    }
+                                                ),
+                                                visible: true,
+                                                source_type: "monitor_capture".to_string(),
+                                                capture_method: "desktop".to_string(),
+                                                device_id: idx.to_string(),
+                                            });
+                                            ui.close_menu();
+                                        }
+                                    }
+                                }
+                            });
+                            ui.menu_button("Window Capture", |ui| {
+                                ui.label("Window selection not implemented");
+                            });
+                            ui.menu_button("Image", |ui| {
+                                ui.label("Image source not implemented");
+                            });
+                            ui.menu_button("Video File", |ui| {
+                                ui.label("Video file source not implemented");
+                            });
+                        });
+                        ui.separator();
+                        // Show sources - collect info first to avoid borrow issues
+                        let source_infos: Vec<(usize, String, String, String)> = self
+                            .sources
+                            .iter()
+                            .enumerate()
+                            .map(|(i, s)| {
+                                (
+                                    i,
+                                    s.name.clone(),
+                                    s.source_type.clone(),
+                                    s.device_id.clone(),
+                                )
+                            })
+                            .collect();
+
+                        for (idx, name, source_type, device_id) in source_infos {
+                            ui.horizontal(|ui| {
+                                let visible = self
+                                    .sources
+                                    .iter()
+                                    .find(|s| s.name == name)
+                                    .map(|s| s.visible)
+                                    .unwrap_or(true);
+                                let mut vis = visible;
+                                ui.checkbox(&mut vis, "");
+                                let response = ui.label(&name);
+
+                                response.context_menu(|ui| {
+                                    ui.label("Source Properties");
+                                    ui.separator();
+                                    ui.label(format!("Type: {}", source_type));
+                                    ui.label(format!("Device: {}", device_id));
+                                    ui.separator();
+                                    if ui.button("Remove").clicked() {
+                                        self.sources.retain(|s| s.name != name);
+                                        ui.close_menu();
+                                    }
+                                });
+                            });
+                        }
+                    }
                 });
         }
     }
@@ -717,23 +1198,57 @@ impl RobsApp {
         if self.show_preview {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
+
+                // Draw background
                 ui.painter()
                     .rect_filled(rect, 2.0, egui::Color32::from_rgb(30, 30, 30));
-                let center = rect.center();
-                ui.painter().text(
-                    center,
-                    egui::Align2::CENTER_CENTER,
-                    "Preview",
-                    egui::FontId::proportional(24.0),
-                    egui::Color32::GRAY,
-                );
-                if self.streaming {
+
+                // Check if we have a monitor capture source visible
+                let has_monitor_source = self
+                    .sources
+                    .iter()
+                    .any(|s| s.visible && s.source_type == "monitor_capture");
+
+                if has_monitor_source {
+                    // Show recording indicator
+                    if self.recording {
+                        let live_rect = egui::Rect::from_min_size(
+                            rect.min + egui::vec2(10.0, 10.0),
+                            egui::vec2(60.0, 25.0),
+                        );
+                        ui.painter().rect_filled(live_rect, 4.0, egui::Color32::RED);
+                        ui.painter().text(
+                            live_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "REC",
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    // Show capture info
+                    let center = rect.center();
                     ui.painter().text(
-                        rect.left_top() + egui::vec2(10.0, 10.0),
-                        egui::Align2::LEFT_TOP,
-                        "● LIVE",
-                        egui::FontId::proportional(18.0),
-                        egui::Color32::RED,
+                        center + egui::vec2(0.0, 20.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Display Capture Active",
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::LIGHT_GRAY,
+                    );
+                } else {
+                    let center = rect.center();
+                    ui.painter().text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        "No Source",
+                        egui::FontId::proportional(24.0),
+                        egui::Color32::GRAY,
+                    );
+                    ui.painter().text(
+                        center + egui::vec2(0.0, 40.0),
+                        egui::Align2::CENTER_CENTER,
+                        "Click '+ Add Source' in Scenes to add Display Capture",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::DARK_GRAY,
                     );
                 }
             });
@@ -787,7 +1302,15 @@ impl RobsApp {
                                         ))
                                         .clicked()
                                     {
-                                        self.recording = !self.recording;
+                                        eprintln!(
+                                            "[Recording] Right panel button clicked! recording={}",
+                                            self.recording
+                                        );
+                                        if self.recording {
+                                            self.stop_recording();
+                                        } else {
+                                            self.start_recording();
+                                        }
                                     }
                                     ui.separator();
                                     if ui.button("Studio Mode").clicked() {}
