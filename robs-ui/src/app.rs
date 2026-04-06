@@ -282,6 +282,7 @@ pub struct RobsApp {
     frame_buffer: HashMap<String, Vec<u8>>,
     // DX11 Desktop Duplication capture (GPU-accelerated)
     dxgi_capture: HashMap<u32, dxgi_capture_rs::DXGIManager>, // monitor_index -> DXGIManager
+    dxgi_failed_monitors: std::collections::HashSet<u32>, // Monitors where DXGI init failed (cache to avoid retry spam)
     // Real-time preview capture (per-source tracking)
     preview_capture_active: bool,
     preview_frame_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
@@ -483,6 +484,7 @@ impl RobsApp {
             frame_buffer: HashMap::new(),
             // DX11 Desktop Duplication capture
             dxgi_capture: HashMap::new(),
+            dxgi_failed_monitors: std::collections::HashSet::new(),
             // Real-time preview
             preview_capture_active: false,
             preview_frame_sender: None,
@@ -1063,52 +1065,155 @@ impl RobsApp {
         }
     }
 
-    /// Capture a specific monitor using DXGI Desktop Duplication (DX11-based, GPU-accelerated)
+    /// Capture a specific monitor using hybrid DXGI (primary) + GDI (fallback)
     /// monitor_index: 0 = primary, 1+ = secondary monitors
     fn capture_desktop_frame(&mut self, monitor_index: u32) -> Option<(Vec<u8>, u32, u32)> {
-        // Get or create DXGIManager for this monitor
-        let manager = self.dxgi_capture.entry(monitor_index).or_insert_with(|| {
-            eprintln!(
-                "[DX11] Creating DXGI Desktop Duplication for monitor {}",
-                monitor_index
+        // Try DXGI first (GPU-accelerated)
+        if !self.dxgi_failed_monitors.contains(&monitor_index) {
+            // Get or create DXGIManager for this monitor
+            let manager = match self.dxgi_capture.entry(monitor_index) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    eprintln!(
+                        "[DX11] Creating DXGI Desktop Duplication for monitor {}",
+                        monitor_index
+                    );
+                    match dxgi_capture_rs::DXGIManager::new(16) {
+                        Ok(mut mgr) => {
+                            let (w, h) = mgr.geometry();
+                            eprintln!("[DX11] DXGI initialized - geometry: {}x{}", w, h);
+                            entry.insert(mgr)
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[DX11] Failed to create DXGIManager for monitor {}: {:?}. \
+                                 Falling back to GDI capture for this monitor.",
+                                monitor_index, e
+                            );
+                            // Cache this failure so we don't retry every frame
+                            self.dxgi_failed_monitors.insert(monitor_index);
+                            return self.capture_desktop_frame_gdi(monitor_index);
+                        }
+                    }
+                }
+            };
+
+            // Set the capture source to the correct monitor
+            manager.set_capture_source_index(monitor_index as usize);
+
+            // Capture frame via DXGI
+            match manager.capture_frame_components() {
+                Ok((data, (width, height))) => {
+                    return Some((data, width as u32, height as u32));
+                }
+                Err(dxgi_capture_rs::CaptureError::Timeout) => {
+                    return None;
+                }
+                Err(dxgi_capture_rs::CaptureError::AccessLost) => {
+                    eprintln!(
+                        "[DX11] Access lost for monitor {}, recreating manager",
+                        monitor_index
+                    );
+                    self.dxgi_capture.remove(&monitor_index);
+                    // Retry once on next call
+                    return None;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[DX11] Capture error for monitor {}: {:?}. Falling back to GDI.",
+                        monitor_index, e
+                    );
+                    // Don't remove - might be transient
+                    // Fall through to GDI
+                }
+            }
+        }
+
+        // GDI fallback
+        self.capture_desktop_frame_gdi(monitor_index)
+    }
+
+    /// Fallback: capture monitor using GDI BitBlt
+    fn capture_desktop_frame_gdi(&self, monitor_index: u32) -> Option<(Vec<u8>, u32, u32)> {
+        let monitors = get_monitors();
+        let monitor = monitors.get(monitor_index as usize)?;
+
+        eprintln!(
+            "[GDI] Capturing monitor {} ({}x{} at {},{})",
+            monitor_index, monitor.width, monitor.height, monitor.position_x, monitor.position_y
+        );
+
+        unsafe {
+            let hdc_screen = GetDC(HWND(std::ptr::null_mut()));
+            if hdc_screen.is_invalid() {
+                return None;
+            }
+
+            let cap_w = monitor.width as i32;
+            let cap_h = monitor.height as i32;
+            let cap_x = monitor.position_x;
+            let cap_y = monitor.position_y;
+
+            if cap_w <= 0 || cap_h <= 0 {
+                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+                return None;
+            }
+
+            let mem_dc = CreateCompatibleDC(hdc_screen);
+            let bitmap = CreateCompatibleBitmap(hdc_screen, cap_w, cap_h);
+            let old_bitmap = SelectObject(mem_dc, bitmap);
+
+            let bitblt_ok = BitBlt(
+                mem_dc,
+                0,
+                0,
+                cap_w,
+                cap_h,
+                hdc_screen,
+                cap_x,
+                cap_y,
+                SRCCOPY | CAPTUREBLT,
             );
-            dxgi_capture_rs::DXGIManager::new(16) // 16ms timeout (~60fps)
-                .expect("Failed to create DXGIManager - Desktop Duplication may not be supported")
-        });
 
-        // Set the capture source to the correct monitor
-        manager.set_capture_source_index(monitor_index as usize);
+            if bitblt_ok.is_ok() {
+                let mut bmi = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: cap_w,
+                    biHeight: -(cap_h), // Top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
 
-        // Capture frame via DXGI (GPU-accelerated, returns BGRA8 pixels)
-        match manager.capture_frame() {
-            Ok((pixels, (width, height))) => {
-                // Convert BGRA8 to raw bytes (BGRA8 is already in BGRA byte order)
-                let data: Vec<u8> = pixels
-                    .into_iter()
-                    .flat_map(|p| [p.b, p.g, p.r, p.a])
-                    .collect();
-                Some((data, width as u32, height as u32))
-            }
-            Err(dxgi_capture_rs::CaptureError::Timeout) => {
-                // No new frame available - normal occurrence
-                None
-            }
-            Err(dxgi_capture_rs::CaptureError::AccessLost) => {
-                // Display mode changed - recreate manager
-                eprintln!(
-                    "[DX11] Access lost for monitor {}, recreating manager",
-                    monitor_index
+                let width = cap_w as u32;
+                let height = cap_h as u32;
+                let mut buffer = vec![0u8; (width * height * 4) as usize];
+                let got_bits = GetDIBits(
+                    mem_dc,
+                    bitmap,
+                    0,
+                    height,
+                    Some(buffer.as_mut_ptr() as *mut _),
+                    &mut bmi as *mut _ as *mut BITMAPINFO,
+                    DIB_RGB_COLORS,
                 );
-                self.dxgi_capture.remove(&monitor_index);
-                None
+
+                let _ = SelectObject(mem_dc, old_bitmap);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+
+                if got_bits != 0 {
+                    return Some((buffer, width, height));
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "[DX11] Capture error for monitor {}: {:?}",
-                    monitor_index, e
-                );
-                None
-            }
+
+            let _ = SelectObject(mem_dc, old_bitmap);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+            None
         }
     }
 
@@ -1222,8 +1327,18 @@ impl RobsApp {
 
         // Create source image
         let src_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_raw(src_width, src_height, rgba_data)
-                .expect("Failed to create source image");
+            match ImageBuffer::from_raw(src_width, src_height, rgba_data) {
+                Some(img) => img,
+                None => {
+                    eprintln!(
+                        "[Scale] Failed to create {}x{} image ({} bytes)",
+                        src_width,
+                        src_height,
+                        data.len()
+                    );
+                    return data.to_vec();
+                }
+            };
 
         // Resize to output resolution using bilinear filtering
         let dst_img = image::imageops::resize(
