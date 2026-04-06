@@ -2,10 +2,14 @@ use eframe::egui;
 use parking_lot::RwLock;
 use robs_chat::aggregator::ChatAggregator;
 use robs_chat::message::{ChatEvent, UnifiedChatMessage};
+use robs_core::scene::{Alignment, Crop, Position, Scale, Scene};
 use robs_core::traits::VideoSource;
+use robs_core::types::{SceneItemId, SourceId};
+use robs_core::SceneCollection;
 use robs_encoding::detect_encoders;
 use robs_outputs::FileOutput;
 use robs_profiles::profile::ProfileManager;
+use robs_sources::native_capture::{get_open_windows, WindowCaptureSource};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
@@ -13,6 +17,9 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Clone)]
 struct MonitorInfo {
@@ -220,8 +227,7 @@ pub struct RobsApp {
     chat_input: String,
     chat_rx: Option<mpsc::Receiver<ChatEvent>>,
     current_scene: String,
-    scenes: Vec<String>,
-    sources: Vec<SourceEntry>,
+    scenes: SceneCollection, // Migrated to SceneCollection
     show_settings: bool,
     settings_rect: Option<egui::Rect>,
     active_settings_tab: usize,
@@ -232,7 +238,6 @@ pub struct RobsApp {
     fps: f64,
     active_panel: Panel,
     show_preview: bool,
-    show_sources: bool,
     show_scenes: bool,
     show_controls: bool,
     show_audio: bool,
@@ -271,19 +276,31 @@ pub struct RobsApp {
     recording_start_time: Option<u64>,
     last_recording_path: String,
     ffmpeg_recording_handle: Option<std::process::Child>, // Store FFmpeg process handle for graceful shutdown
-    // Video capture
+    // Video capture / Preview
     active_video_source: Option<Box<dyn VideoSource>>,
-    preview_texture: Option<egui::TextureHandle>,
+    preview_textures: HashMap<SceneItemId, egui::TextureHandle>, // One texture per source
     frame_buffer: HashMap<String, Vec<u8>>,
-}
-
-#[derive(Clone)]
-struct SourceEntry {
-    name: String,
-    visible: bool,
-    source_type: String,
-    capture_method: String, // "desktop", "window", "image", "video"
-    device_id: String,      // monitor index, window name, etc.
+    // Real-time preview capture (per-source tracking)
+    preview_capture_active: bool,
+    preview_frame_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    preview_capture_handle: Option<std::process::Child>, // Store FFmpeg process for preview
+    preview_frame_receiver: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    // Native preview capture state
+    preview_hwnd: Option<isize>, // Window handle for native preview capture
+    preview_frame_count: u64,
+    // Source properties modal state
+    show_source_properties: bool,
+    editing_source_id: Option<SceneItemId>,
+    editing_source_name: String,
+    editing_source_pos_x: f32,
+    editing_source_pos_y: f32,
+    editing_source_scale_x: f32,
+    editing_source_scale_y: f32,
+    editing_source_rotation: f32,
+    editing_source_crop_left: u32,
+    editing_source_crop_top: u32,
+    editing_source_crop_right: u32,
+    editing_source_crop_bottom: u32,
 }
 
 #[derive(Clone)]
@@ -293,6 +310,37 @@ struct AudioChannel {
     muted: bool,
     device_id: String, // device ID or "disabled" or "default"
     is_desktop: bool,  // true = desktop audio, false = mic/aux
+}
+
+/// Parse monitor coordinates from a display capture source name
+/// Format: "Display Capture - Name|idx:X|x:Y|y:Z|w:W|h:H"
+/// Returns (x, y, width, height) in virtual screen coordinates
+fn parse_monitor_coords(source_name: &str) -> (i32, i32, i32, i32) {
+    // Default to primary monitor at 1920x1080 if parsing fails
+    let mut cap_x = 0i32;
+    let mut cap_y = 0i32;
+    let mut cap_w = 1920i32;
+    let mut cap_h = 1080i32;
+
+    // Try to parse the extended format
+    if let Some(pipe_pos) = source_name.find('|') {
+        let params = &source_name[pipe_pos + 1..];
+        for param in params.split('|') {
+            if let Some(colon_pos) = param.find(':') {
+                let key = &param[..colon_pos];
+                let value = &param[colon_pos + 1..];
+                match key {
+                    "x" => cap_x = value.parse().unwrap_or(0),
+                    "y" => cap_y = value.parse().unwrap_or(0),
+                    "w" => cap_w = value.parse().unwrap_or(1920),
+                    "h" => cap_h = value.parse().unwrap_or(1080),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    (cap_x, cap_y, cap_w, cap_h)
 }
 
 impl RobsApp {
@@ -339,9 +387,13 @@ impl RobsApp {
             chat_messages: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
             chat_input: String::new(),
             chat_rx: None,
-            current_scene: "Scene 1".to_string(),
-            scenes: vec!["Scene 1".to_string()],
-            sources: vec![],
+            current_scene: "Main Scene".to_string(),
+            scenes: {
+                let mut col = SceneCollection::new();
+                col.create_scene("Main Scene".to_string());
+                col.set_current_scene("Main Scene");
+                col
+            },
             show_settings: false,
             settings_rect: None,
             audio_channels: vec![
@@ -366,7 +418,6 @@ impl RobsApp {
             fps: 30.0,
             active_panel: Panel::Preview,
             show_preview: true,
-            show_sources: true,
             show_scenes: true,
             show_controls: true,
             show_audio: true,
@@ -407,8 +458,29 @@ impl RobsApp {
             last_recording_path: String::new(),
             ffmpeg_recording_handle: None,
             active_video_source: None,
-            preview_texture: None,
+            preview_textures: HashMap::new(),
             frame_buffer: HashMap::new(),
+            // Real-time preview
+            preview_capture_active: false,
+            preview_frame_sender: None,
+            preview_capture_handle: None,
+            preview_frame_receiver: None,
+            // Native preview capture
+            preview_hwnd: None,
+            preview_frame_count: 0,
+            // Source properties modal
+            show_source_properties: false,
+            editing_source_id: None,
+            editing_source_name: String::new(),
+            editing_source_pos_x: 0.0,
+            editing_source_pos_y: 0.0,
+            editing_source_scale_x: 1.0,
+            editing_source_scale_y: 1.0,
+            editing_source_rotation: 0.0,
+            editing_source_crop_left: 0,
+            editing_source_crop_top: 0,
+            editing_source_crop_right: 0,
+            editing_source_crop_bottom: 0,
         }
     }
 
@@ -464,53 +536,80 @@ impl RobsApp {
 
         self.last_recording_path = full_path.to_string_lossy().into_owned();
 
-        // Find the active monitor capture source and get device_id
-        eprintln!("[Recording] Looking for monitor_capture source...");
-        eprintln!("[Recording] Total sources: {}", self.sources.len());
-        for (i, s) in self.sources.iter().enumerate() {
-            eprintln!(
-                "[Recording] Source {}: name='{}' type='{}' visible={} device_id='{}'",
-                i, s.name, s.source_type, s.visible, s.device_id
-            );
+        // Find the active capture source from current scene
+        eprintln!("[Recording] Looking for capture source...");
+        if let Some(scene) = self.scenes.current_scene() {
+            eprintln!("[Recording] Total items in scene: {}", scene.item_count());
+            for (i, item) in scene.items().iter().enumerate() {
+                eprintln!(
+                    "[Recording] Item {}: name='{}' visible={}",
+                    i,
+                    item.name(),
+                    item.is_visible()
+                );
+            }
         }
 
-        let (input_spec, offset_x, offset_y, video_width, video_height) = self
-            .sources
-            .iter()
-            .find(|s| s.visible && s.source_type == "monitor_capture")
-            .map(|s| {
-                eprintln!(
-                    "[Recording] Found source: {} device_id={}",
-                    s.name, s.device_id
-                );
+        // Check for window_capture first, then fall back to monitor_capture
+        // Now using SceneCollection instead of flat sources list
+        let scene = self.scenes.current_scene();
 
-                let device_id: u32 = s.device_id.parse().unwrap_or(0);
+        let (input_spec, offset_x, offset_y, video_width, video_height, use_window_capture) =
+            if let Some(scene) = scene {
+                // Find first visible window_capture item
+                let window_item = scene
+                    .items()
+                    .iter()
+                    .find(|i| i.is_visible() && i.name().starts_with("Window:"));
 
-                // Get monitor info for this device
-                let monitors = get_monitors();
-                eprintln!("[Recording] Total monitors available: {}", monitors.len());
+                if let Some(item) = window_item {
+                    let window_title = item.name().strip_prefix("Window: ").unwrap_or(item.name());
+                    eprintln!("[Recording] Found window_capture source: {}", window_title);
+                    (format!("title={}", window_title), 0, 0, 0, 0, true)
+                } else {
+                    // Check for monitor capture
+                    let monitor_item = scene
+                        .items()
+                        .iter()
+                        .find(|i| i.is_visible() && i.name().starts_with("Display Capture"));
 
-                let monitor = monitors.get(device_id as usize);
+                    if let Some(item) = monitor_item {
+                        // Parse device_id from item name or default to 0
+                        let device_id = if item.name().contains("Monitor 2") {
+                            1u32
+                        } else {
+                            0u32
+                        };
 
-                // Always use "desktop" - desktop@N doesn't work
-                let input = "desktop".to_string();
+                        eprintln!("[Recording] Found monitor_capture source: {}", item.name());
 
-                // Get offset and size from monitor
-                let (ox, oy, width, height) = monitor
-                    .map(|m| {
-                        eprintln!(
-                            "[Recording] Selected monitor: {} {}x{} at ({},{})",
-                            m.name, m.width, m.height, m.position_x, m.position_y
-                        );
-                        (m.position_x, m.position_y, m.width, m.height)
-                    })
-                    .unwrap_or((0, 0, 1920, 1080));
-                (input, ox, oy, width, height)
-            })
-            .unwrap_or_else(|| {
-                eprintln!("[Recording] No monitor_capture source found!");
-                ("desktop".to_string(), 0, 0, 1920, 1080)
-            });
+                        let monitors = get_monitors();
+                        let monitor = monitors.get(device_id as usize);
+
+                        let input = "desktop".to_string();
+                        let (ox, oy, width, height) = monitor
+                            .map(|m| {
+                                eprintln!(
+                                    "[Recording] Selected monitor: {} {}x{} at ({},{})",
+                                    m.name, m.width, m.height, m.position_x, m.position_y
+                                );
+                                (m.position_x, m.position_y, m.width, m.height)
+                            })
+                            .unwrap_or((0, 0, 1920, 1080));
+                        (input, ox, oy, width, height, false)
+                    } else {
+                        eprintln!("[Recording] No capture source found in scene!");
+                        ("desktop".to_string(), 0, 0, 1920, 1080, false)
+                    }
+                }
+            } else {
+                eprintln!("[Recording] No current scene!");
+                ("desktop".to_string(), 0, 0, 1920, 1080, false)
+            };
+
+        // If we found a window capture, use window dimensions (0 means we'll get them from the window)
+        let final_width = if use_window_capture { 0 } else { video_width };
+        let final_height = if use_window_capture { 0 } else { video_height };
 
         eprintln!(
             "[Recording] Using input: {} at offset ({}, {}) size {}x{}",
@@ -531,21 +630,29 @@ impl RobsApp {
         let format = self.recording_format.clone();
         let mut ffmpeg_args = Vec::new();
 
-        // Input: desktop capture with gdigrab
+        // Input: capture based on source type
         ffmpeg_args.push("-f".into());
         ffmpeg_args.push("gdigrab".into());
         ffmpeg_args.push("-framerate".into());
         ffmpeg_args.push("30".into());
         ffmpeg_args.push("-draw_mouse".into());
         ffmpeg_args.push("1".into());
-        ffmpeg_args.push("-offset_x".into());
-        ffmpeg_args.push(offset_x.to_string());
-        ffmpeg_args.push("-offset_y".into());
-        ffmpeg_args.push(offset_y.to_string());
-        ffmpeg_args.push("-video_size".into());
-        ffmpeg_args.push(format!("{}x{}", video_width, video_height));
-        ffmpeg_args.push("-i".into());
-        ffmpeg_args.push("desktop".into());
+
+        if use_window_capture {
+            // Window capture - don't set offset or size, let FFmpeg auto-detect
+            ffmpeg_args.push("-i".into());
+            ffmpeg_args.push(input_spec.clone()); // "title=Window Name"
+        } else {
+            // Monitor capture
+            ffmpeg_args.push("-offset_x".into());
+            ffmpeg_args.push(offset_x.to_string());
+            ffmpeg_args.push("-offset_y".into());
+            ffmpeg_args.push(offset_y.to_string());
+            ffmpeg_args.push("-video_size".into());
+            ffmpeg_args.push(format!("{}x{}", final_width, final_height));
+            ffmpeg_args.push("-i".into());
+            ffmpeg_args.push(input_spec.clone());
+        }
 
         // Get desktop audio and mic/aux device settings
         let desktop_audio_device = self
@@ -816,6 +923,341 @@ impl RobsApp {
         self.recording_start_time = None;
     }
 
+    fn start_preview_capture(&mut self) {
+        if self.preview_capture_active {
+            return;
+        }
+
+        // For now, just mark as active - actual capture will use recording pipeline
+        // This is a placeholder until we can integrate with the video pipeline properly
+        self.preview_capture_active = true;
+        eprintln!("[Preview] Preview capture requested (using recording pipeline)");
+    }
+
+    fn stop_preview_capture(&mut self) {
+        if !self.preview_capture_active {
+            return;
+        }
+
+        self.preview_capture_active = false;
+        self.preview_hwnd = None;
+        eprintln!("[Preview] Preview capture stopped");
+    }
+
+    /// Capture a frame from the window using GDI (native Windows API)
+    fn capture_native_frame(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        let hwnd = self.preview_hwnd?;
+
+        unsafe {
+            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
+
+            // Get client rect (interior content, not window border)
+            let mut client_rect = RECT::default();
+            let rect_ok = GetClientRect(hwnd, &mut client_rect);
+            if rect_ok.is_err() {
+                return None;
+            }
+
+            let width = client_rect.right - client_rect.left;
+            let height = client_rect.bottom - client_rect.top;
+
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+
+            let width = width as u32;
+            let height = height as u32;
+
+            // Get client DC (captures interior content, not frame)
+            let hdc = GetDC(hwnd);
+            if hdc.is_invalid() {
+                return None;
+            }
+
+            // Create compatible DC and bitmap
+            let mem_dc = CreateCompatibleDC(hdc);
+            let bitmap = CreateCompatibleBitmap(hdc, width as i32, height as i32);
+            let old_bitmap = SelectObject(mem_dc, bitmap);
+
+            // BitBlt the client content
+            let bitblt_ok = BitBlt(
+                mem_dc,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                hdc,
+                0,
+                0,
+                SRCCOPY,
+            );
+
+            // Get the bitmap data
+            if bitblt_ok.is_ok() {
+                let mut bmi = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32), // Top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
+
+                let mut buffer = vec![0u8; (width * height * 4) as usize];
+                let got_bits = GetDIBits(
+                    mem_dc,
+                    bitmap,
+                    0,
+                    height,
+                    Some(buffer.as_mut_ptr() as *mut _),
+                    &mut bmi as *mut _ as *mut BITMAPINFO,
+                    DIB_RGB_COLORS,
+                );
+
+                // Cleanup
+                let _ = SelectObject(mem_dc, old_bitmap);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(hwnd, hdc);
+
+                if got_bits == 0 {
+                    return None;
+                }
+
+                self.preview_frame_count += 1;
+
+                return Some((buffer, width, height));
+            }
+
+            // Cleanup on failure
+            let _ = SelectObject(mem_dc, old_bitmap);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(hwnd, hdc);
+
+            return None;
+        }
+    }
+
+    /// Capture a specific monitor region using GDI
+    /// x, y are in virtual screen coordinates
+    fn capture_desktop_frame(
+        &self,
+        cap_x: i32,
+        cap_y: i32,
+        cap_w: i32,
+        cap_h: i32,
+    ) -> Option<(Vec<u8>, u32, u32)> {
+        unsafe {
+            // Get DC for the entire virtual screen (all monitors)
+            let hdc_screen = GetDC(HWND(std::ptr::null_mut()));
+            if hdc_screen.is_invalid() {
+                return None;
+            }
+
+            let width = cap_w as u32;
+            let height = cap_h as u32;
+
+            if width == 0 || height == 0 {
+                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+                return None;
+            }
+
+            // Create compatible DC and bitmap
+            let mem_dc = CreateCompatibleDC(hdc_screen);
+            let bitmap = CreateCompatibleBitmap(hdc_screen, cap_w, cap_h);
+            let old_bitmap = SelectObject(mem_dc, bitmap);
+
+            // BitBlt from screen to memory DC at the specified region
+            let bitblt_ok = BitBlt(
+                mem_dc,
+                0,
+                0,
+                cap_w,
+                cap_h,
+                hdc_screen,
+                cap_x,
+                cap_y,
+                SRCCOPY | CAPTUREBLT,
+            );
+
+            if bitblt_ok.is_ok() {
+                let mut bmi = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: cap_w,
+                    biHeight: -(cap_h), // Top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
+
+                let mut buffer = vec![0u8; (width * height * 4) as usize];
+                let got_bits = GetDIBits(
+                    mem_dc,
+                    bitmap,
+                    0,
+                    cap_h as u32,
+                    Some(buffer.as_mut_ptr() as *mut _),
+                    &mut bmi as *mut _ as *mut BITMAPINFO,
+                    DIB_RGB_COLORS,
+                );
+
+                // Cleanup
+                let _ = SelectObject(mem_dc, old_bitmap);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+
+                if got_bits == 0 {
+                    return None;
+                }
+
+                return Some((buffer, width, height));
+            }
+
+            // Cleanup on failure
+            let _ = SelectObject(mem_dc, old_bitmap);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
+
+            None
+        }
+    }
+
+    fn process_preview_frames(&mut self, ctx: &egui::Context) {
+        // Get output resolution (the resolution we're streaming/recording at)
+        let output_width = self.output_width;
+        let output_height = self.output_height;
+
+        // Collect all visible capture source items first to avoid borrow issues
+        let scene = self.scenes.current_scene();
+        let capture_items: Vec<_> = scene
+            .map(|s| {
+                s.items()
+                    .iter()
+                    .filter(|i| {
+                        i.is_visible()
+                            && (i.name().starts_with("Window:")
+                                || i.name().starts_with("Display Capture"))
+                    })
+                    .map(|i| (i.id(), i.name().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if capture_items.is_empty() {
+            // No capture sources - stop preview
+            if self.preview_capture_active {
+                self.preview_capture_active = false;
+                self.preview_hwnd = None;
+                eprintln!("[Preview] No capture sources, stopping preview");
+            }
+            return;
+        }
+
+        self.preview_capture_active = true;
+        self.preview_frame_count += 1;
+
+        // Capture each source independently
+        for (item_id, item_name) in &capture_items {
+            let texture_key = *item_id;
+
+            if item_name.starts_with("Window:") {
+                // Window capture - use native GDI (requires HWND)
+                // For now, skip window capture in preview until we store HWND in scene items
+                eprintln!(
+                    "[Preview] Window capture preview pending (HWND not stored in scene item)"
+                );
+            } else if item_name.starts_with("Display Capture") {
+                // Display capture - parse monitor coordinates from source name
+                let (cap_x, cap_y, cap_w, cap_h) = parse_monitor_coords(item_name);
+
+                if let Some((data, width, height)) =
+                    self.capture_desktop_frame(cap_x, cap_y, cap_w, cap_h)
+                {
+                    // Scale to output resolution
+                    let scaled_data = self.scale_frame_to_output(
+                        &data,
+                        width,
+                        height,
+                        output_width,
+                        output_height,
+                    );
+
+                    let mut rgba_data = scaled_data.clone();
+                    for chunk in rgba_data.chunks_exact_mut(4) {
+                        chunk.swap(0, 2); // BGRA -> RGBA
+                    }
+
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [output_width as usize, output_height as usize],
+                        &rgba_data,
+                    );
+
+                    let texture = ctx.load_texture(
+                        format!("preview_{}", texture_key.0 .0),
+                        color_image,
+                        egui::TextureOptions::default(),
+                    );
+                    self.preview_textures.insert(texture_key, texture);
+                }
+            }
+        }
+
+        // Clean up textures for sources that no longer exist
+        let active_ids: std::collections::HashSet<SceneItemId> =
+            capture_items.iter().map(|(id, _)| *id).collect();
+        self.preview_textures
+            .retain(|id, _| active_ids.contains(id));
+    }
+
+    /// Scale captured frame to output resolution (OBS-style: preview matches output)
+    fn scale_frame_to_output(
+        &self,
+        data: &[u8],
+        src_width: u32,
+        src_height: u32,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> Vec<u8> {
+        use image::{ImageBuffer, Rgba};
+
+        // If dimensions match, return original
+        if src_width == dst_width && src_height == dst_height {
+            return data.to_vec();
+        }
+
+        // Convert BGRA to RGBA for image crate
+        let mut rgba_data = data.to_vec();
+        for chunk in rgba_data.chunks_exact_mut(4) {
+            chunk.swap(0, 2); // BGRA -> RGBA
+        }
+
+        // Create source image
+        let src_img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_raw(src_width, src_height, rgba_data)
+                .expect("Failed to create source image");
+
+        // Resize to output resolution using bilinear filtering
+        let dst_img = image::imageops::resize(
+            &src_img,
+            dst_width,
+            dst_height,
+            image::imageops::FilterType::Triangle,
+        );
+
+        // Convert back to BGRA
+        let mut output = dst_img.into_raw();
+        for chunk in output.chunks_exact_mut(4) {
+            chunk.swap(0, 2); // RGBA -> BGRA
+        }
+
+        output
+    }
+
     fn format_time(seconds: u64) -> String {
         let h = seconds / 3600;
         let m = (seconds % 3600) / 60;
@@ -853,7 +1295,6 @@ impl RobsApp {
                 });
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_preview, "Preview");
-                    ui.checkbox(&mut self.show_sources, "Sources");
                     ui.checkbox(&mut self.show_scenes, "Scenes");
                     ui.checkbox(&mut self.show_controls, "Controls");
                     ui.checkbox(&mut self.show_audio, "Audio Mixer");
@@ -1288,33 +1729,6 @@ impl RobsApp {
         });
     }
 
-    fn sources_panel(&mut self, ctx: &egui::Context) {
-        if self.show_sources {
-            egui::SidePanel::left("sources_panel")
-                .default_width(250.0)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    ui.heading("Sources");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("+ Add").clicked() {}
-                        if ui.button("↑").clicked() {}
-                        if ui.button("↓").clicked() {}
-                        if ui.button("−").clicked() {}
-                    });
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for source in self.sources.iter_mut() {
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut source.visible, "");
-                                ui.label(&source.name);
-                            });
-                        }
-                    });
-                });
-        }
-    }
-
     fn scenes_panel(&mut self, ctx: &egui::Context) {
         if self.show_scenes {
             egui::SidePanel::left("scenes_panel")
@@ -1325,57 +1739,54 @@ impl RobsApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("+ Add").clicked() {
-                            self.scenes.push(format!("Scene {}", self.scenes.len() + 1));
+                            let name = format!("Scene {}", self.scenes.count() + 1);
+                            self.scenes.create_scene(name.clone());
+                            self.scenes.set_current_scene(&name);
+                            self.current_scene = name;
                         }
                         if ui.button("−").clicked() {
-                            if self.scenes.len() > 1 {
-                                self.scenes.pop();
+                            if self.scenes.count() > 1 {
+                                if let Some(name) = self.scenes.current_scene_name() {
+                                    let name = name.to_string(); // Copy for later use
+                                    self.scenes.remove(&name);
+                                    // Switch to first available scene - collect names first
+                                    let scene_names: Vec<String> =
+                                        self.scenes.list().iter().map(|s| s.to_string()).collect();
+                                    if let Some(first) = scene_names.first() {
+                                        self.scenes.set_current_scene(first);
+                                        self.current_scene = first.clone();
+                                    }
+                                }
                             }
                         }
                     });
                     ui.separator();
+
+                    // Collect scene list to avoid borrow issues
+                    let scene_names: Vec<String> =
+                        self.scenes.list().iter().map(|s| s.to_string()).collect();
+
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        for scene in self.scenes.iter() {
-                            let selected = *scene == self.current_scene;
-                            if ui.selectable_label(selected, scene).clicked() {
-                                self.current_scene = scene.clone();
+                        for name in &scene_names {
+                            let selected = self.current_scene == *name;
+                            if ui.selectable_label(selected, name).clicked() {
+                                self.scenes.set_current_scene(name);
+                                self.current_scene = name.clone();
                             }
                         }
                     });
 
-                    // Show sources for current scene
-                    if self.current_scene == "Scene 1" {
+                    // Show sources for current scene - get data first to avoid borrow issues
+                    let scene_name = self.scenes.current_scene_name().map(|s| s.to_string());
+                    if let Some(name) = scene_name {
                         ui.separator();
                         ui.heading("Sources");
                         ui.separator();
                         ui.menu_button("+ Add Source", |ui| {
                             ui.menu_button("Display Capture", |ui| {
-                                // Get actual monitor info from Windows
                                 let monitors = get_monitors();
-
                                 if monitors.is_empty() {
                                     ui.label("No monitors detected");
-                                    // Fallback to old behavior
-                                    for monitor_id in 0..2 {
-                                        let monitor_name = if monitor_id == 0 {
-                                            "Monitor 1 (Primary)"
-                                        } else {
-                                            "Monitor 2"
-                                        };
-                                        if ui.button(monitor_name).clicked() {
-                                            self.sources.push(SourceEntry {
-                                                name: format!(
-                                                    "Display Capture - Monitor {}",
-                                                    monitor_id + 1
-                                                ),
-                                                visible: true,
-                                                source_type: "monitor_capture".to_string(),
-                                                capture_method: "desktop".to_string(),
-                                                device_id: monitor_id.to_string(),
-                                            });
-                                            ui.close_menu();
-                                        }
-                                    }
                                 } else {
                                     ui.label("Select Monitor:");
                                     for (idx, monitor) in monitors.iter().enumerate() {
@@ -1395,77 +1806,291 @@ impl RobsApp {
                                             )
                                         };
                                         if ui.button(label).clicked() {
-                                            self.sources.push(SourceEntry {
-                                                name: format!(
-                                                    "Display Capture - {}",
-                                                    if monitor.is_primary {
-                                                        "Primary"
-                                                    } else {
-                                                        &monitor.name
-                                                    }
-                                                ),
-                                                visible: true,
-                                                source_type: "monitor_capture".to_string(),
-                                                capture_method: "desktop".to_string(),
-                                                device_id: idx.to_string(),
-                                            });
+                                            if let Some(scene) = self.scenes.current_scene_mut() {
+                                                let source_id =
+                                                    SourceId(robs_core::types::ObjectId::new());
+                                                // Store monitor index and coordinates in the name for capture
+                                                let mon_name = if monitor.is_primary {
+                                                    "Primary"
+                                                } else {
+                                                    &monitor.name
+                                                };
+                                                scene.add_source(
+                                                    source_id,
+                                                    format!(
+                                                        "Display Capture - {}|idx:{}|x:{}|y:{}|w:{}|h:{}",
+                                                        mon_name,
+                                                        idx,
+                                                        monitor.position_x,
+                                                        monitor.position_y,
+                                                        monitor.width,
+                                                        monitor.height
+                                                    ),
+                                                );
+                                            }
                                             ui.close_menu();
                                         }
                                     }
                                 }
                             });
                             ui.menu_button("Window Capture", |ui| {
-                                ui.label("Window selection not implemented");
-                            });
-                            ui.menu_button("Image", |ui| {
-                                ui.label("Image source not implemented");
-                            });
-                            ui.menu_button("Video File", |ui| {
-                                ui.label("Video file source not implemented");
+                                let windows = get_open_windows();
+                                if windows.is_empty() {
+                                    ui.label("No windows found");
+                                } else {
+                                    ui.label("Select Window:");
+                                    for window in windows.iter().take(50) {
+                                        let label: String = window.title.chars().take(40).collect();
+                                        let label = if window.title.chars().count() > 40 {
+                                            format!("{}...", label)
+                                        } else {
+                                            label
+                                        };
+
+                                        if ui.button(&label).clicked() {
+                                            if let Some(scene) = self.scenes.current_scene_mut() {
+                                                let source_id =
+                                                    SourceId(robs_core::types::ObjectId::new());
+                                                scene.add_source(
+                                                    source_id,
+                                                    format!("Window: {}", window.title),
+                                                );
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    }
+                                }
                             });
                         });
-                        ui.separator();
-                        // Show sources - collect info first to avoid borrow issues
-                        let source_infos: Vec<(usize, String, String, String)> = self
-                            .sources
-                            .iter()
-                            .enumerate()
-                            .map(|(i, s)| {
-                                (
-                                    i,
-                                    s.name.clone(),
-                                    s.source_type.clone(),
-                                    s.device_id.clone(),
-                                )
-                            })
-                            .collect();
 
-                        for (idx, name, source_type, device_id) in source_infos {
+                        // Display sources in current scene - get items first
+                        let items_data: Vec<_> = if let Some(scene) = self.scenes.get(&name) {
+                            scene
+                                .items()
+                                .iter()
+                                .map(|i| {
+                                    let pos = i.position();
+                                    let scale = i.scale();
+                                    let crop = i.crop();
+                                    (
+                                        i.id(),
+                                        i.name().to_string(),
+                                        i.is_visible(),
+                                        pos.x,
+                                        pos.y,
+                                        scale.x,
+                                        scale.y,
+                                        i.rotation(),
+                                        crop.left,
+                                        crop.top,
+                                        crop.right,
+                                        crop.bottom,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        for (
+                            id,
+                            item_name,
+                            is_visible,
+                            _px,
+                            _py,
+                            _sx,
+                            _sy,
+                            _rot,
+                            _cl,
+                            _ct,
+                            _cr,
+                            _cb,
+                        ) in items_data
+                        {
+                            let mut visible = is_visible;
                             ui.horizontal(|ui| {
-                                let visible = self
-                                    .sources
-                                    .iter()
-                                    .find(|s| s.name == name)
-                                    .map(|s| s.visible)
-                                    .unwrap_or(true);
-                                let mut vis = visible;
-                                ui.checkbox(&mut vis, "");
-                                let response = ui.label(&name);
+                                ui.checkbox(&mut visible, "");
+                                let response = ui.label(&item_name);
 
+                                // Context menu: Remove, Properties
                                 response.context_menu(|ui| {
-                                    ui.label("Source Properties");
+                                    if ui.button("Properties").clicked() {
+                                        // Load source properties into editing fields
+                                        if let Some(scene) = self.scenes.get_mut(&name) {
+                                            if let Some(item) = scene.item_mut(id) {
+                                                self.editing_source_id = Some(id);
+                                                self.editing_source_name = item.name().to_string();
+                                                let pos = item.position();
+                                                let scale = item.scale();
+                                                let crop = item.crop();
+                                                self.editing_source_pos_x = pos.x;
+                                                self.editing_source_pos_y = pos.y;
+                                                self.editing_source_scale_x = scale.x;
+                                                self.editing_source_scale_y = scale.y;
+                                                self.editing_source_rotation = item.rotation();
+                                                self.editing_source_crop_left = crop.left;
+                                                self.editing_source_crop_top = crop.top;
+                                                self.editing_source_crop_right = crop.right;
+                                                self.editing_source_crop_bottom = crop.bottom;
+                                                self.show_source_properties = true;
+                                            }
+                                        }
+                                        ui.close_menu();
+                                    }
                                     ui.separator();
-                                    ui.label(format!("Type: {}", source_type));
-                                    ui.label(format!("Device: {}", device_id));
+                                    // Move order controls
+                                    ui.horizontal(|ui| {
+                                        ui.label("Order:");
+                                        if ui.small_button("↑").clicked() {
+                                            if let Some(scene) = self.scenes.get_mut(&name) {
+                                                scene.move_item_up(id);
+                                            }
+                                            ui.close_menu();
+                                        }
+                                        if ui.small_button("↓").clicked() {
+                                            if let Some(scene) = self.scenes.get_mut(&name) {
+                                                scene.move_item_down(id);
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    });
                                     ui.separator();
                                     if ui.button("Remove").clicked() {
-                                        self.sources.retain(|s| s.name != name);
+                                        if let Some(scene) = self.scenes.get_mut(&name) {
+                                            scene.remove_item(id);
+                                        }
                                         ui.close_menu();
                                     }
                                 });
                             });
+                            // Update visibility if changed
+                            if visible != is_visible {
+                                if let Some(scene) = self.scenes.current_scene_mut() {
+                                    scene.set_item_visible(id, visible);
+                                }
+                            }
                         }
                     }
+                });
+        }
+    }
+
+    fn source_properties_modal(&mut self, ctx: &egui::Context) {
+        if self.show_source_properties {
+            egui::Window::new("Source Properties")
+                .collapsible(false)
+                .resizable(false)
+                .default_width(320.0)
+                .show(ctx, |ui| {
+                    ui.heading(&self.editing_source_name);
+                    ui.separator();
+
+                    // Position
+                    ui.label("Position");
+                    ui.horizontal(|ui| {
+                        ui.label("X:");
+                        ui.add(egui::DragValue::new(&mut self.editing_source_pos_x).speed(1.0));
+                        ui.label("Y:");
+                        ui.add(egui::DragValue::new(&mut self.editing_source_pos_y).speed(1.0));
+                    });
+
+                    ui.separator();
+
+                    // Scale
+                    ui.label("Scale");
+                    ui.horizontal(|ui| {
+                        ui.label("X:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_scale_x)
+                                .speed(0.01)
+                                .clamp_range(0.01..=10.0),
+                        );
+                        ui.label("Y:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_scale_y)
+                                .speed(0.01)
+                                .clamp_range(0.01..=10.0),
+                        );
+                    });
+
+                    ui.separator();
+
+                    // Rotation
+                    ui.label("Rotation");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_rotation)
+                                .speed(1.0)
+                                .clamp_range(0.0..=360.0),
+                        );
+                        ui.label("degrees");
+                    });
+
+                    ui.separator();
+
+                    // Crop
+                    ui.label("Crop (pixels)");
+                    ui.horizontal(|ui| {
+                        ui.label("L:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_crop_left)
+                                .speed(1.0)
+                                .clamp_range(0..=9999),
+                        );
+                        ui.label("T:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_crop_top)
+                                .speed(1.0)
+                                .clamp_range(0..=9999),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("R:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_crop_right)
+                                .speed(1.0)
+                                .clamp_range(0..=9999),
+                        );
+                        ui.label("B:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.editing_source_crop_bottom)
+                                .speed(1.0)
+                                .clamp_range(0..=9999),
+                        );
+                    });
+
+                    ui.separator();
+
+                    // Apply / Cancel
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            if let Some(id) = self.editing_source_id {
+                                if let Some(scene) = self.scenes.current_scene_mut() {
+                                    if let Some(item) = scene.item_mut(id) {
+                                        item.set_position(Position::new(
+                                            self.editing_source_pos_x,
+                                            self.editing_source_pos_y,
+                                        ));
+                                        item.set_scale(Scale::new(
+                                            self.editing_source_scale_x,
+                                            self.editing_source_scale_y,
+                                        ));
+                                        item.set_rotation(self.editing_source_rotation);
+                                        item.set_crop(Crop::new(
+                                            self.editing_source_crop_left,
+                                            self.editing_source_crop_top,
+                                            self.editing_source_crop_right,
+                                            self.editing_source_crop_bottom,
+                                        ));
+                                    }
+                                }
+                            }
+                            self.show_source_properties = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_source_properties = false;
+                        }
+                    });
                 });
         }
     }
@@ -1479,52 +2104,233 @@ impl RobsApp {
                 ui.painter()
                     .rect_filled(rect, 2.0, egui::Color32::from_rgb(30, 30, 30));
 
-                // Check if we have a monitor capture source visible
-                let has_monitor_source = self
-                    .sources
-                    .iter()
-                    .any(|s| s.visible && s.source_type == "monitor_capture");
+                // Get scene and calculate canvas area
+                let scene = self.scenes.current_scene();
+                let (scene_output_w, scene_output_h) =
+                    scene.map(|s| s.output_size()).unwrap_or((1920, 1080));
 
-                if has_monitor_source {
-                    // Show recording indicator
-                    if self.recording {
-                        let live_rect = egui::Rect::from_min_size(
-                            rect.min + egui::vec2(10.0, 10.0),
-                            egui::vec2(60.0, 25.0),
+                // Calculate preview canvas size (fit scene output into available rect)
+                let available_size = rect.size();
+                let scale_x = available_size.x / scene_output_w as f32;
+                let scale_y = available_size.y / scene_output_h as f32;
+                let canvas_scale = scale_x.min(scale_y) * 0.95;
+
+                let canvas_w = scene_output_w as f32 * canvas_scale;
+                let canvas_h = scene_output_h as f32 * canvas_scale;
+                let canvas_off_x = (available_size.x - canvas_w) / 2.0;
+                let canvas_off_y = (available_size.y - canvas_h) / 2.0;
+
+                let canvas_rect = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(canvas_off_x, canvas_off_y),
+                    egui::vec2(canvas_w, canvas_h),
+                );
+
+                // Draw canvas border
+                ui.painter().rect_stroke(
+                    canvas_rect,
+                    2.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 60, 60)),
+                );
+
+                // Render scene items
+                if let Some(scene) = scene {
+                    // Collect items to avoid borrow issues
+                    let items: Vec<_> = scene
+                        .items()
+                        .iter()
+                        .map(|i| {
+                            let pos = i.position();
+                            let scale = i.scale();
+                            let crop = i.crop();
+                            (
+                                i.id(),
+                                i.name().to_string(),
+                                i.is_visible(),
+                                pos.x,
+                                pos.y,
+                                scale.x,
+                                scale.y,
+                                crop.left,
+                                crop.top,
+                                crop.right,
+                                crop.bottom,
+                            )
+                        })
+                        .collect();
+
+                    for (id, name, visible, px, py, sx, sy, _cl, _ct, _cr, _cb) in items {
+                        if !visible {
+                            continue;
+                        }
+
+                        // Determine source dimensions
+                        let (src_w, src_h) = if name.starts_with("Display Capture") {
+                            // Parse actual monitor dimensions from source name
+                            let (_, _, w, h) = parse_monitor_coords(&name);
+                            (w as f32, h as f32)
+                        } else {
+                            // Window capture - use scene output resolution as default
+                            (scene_output_w as f32, scene_output_h as f32)
+                        };
+
+                        if src_w == 0.0 || src_h == 0.0 {
+                            continue;
+                        }
+
+                        // Calculate rendered size after scaling
+                        let render_w = src_w * sx;
+                        let render_h = src_h * sy;
+
+                        // Calculate position on canvas (scene coords -> canvas coords)
+                        let item_x = canvas_rect.min.x + px * canvas_scale;
+                        let item_y = canvas_rect.min.y + py * canvas_scale;
+                        let item_w = render_w * canvas_scale;
+                        let item_h = render_h * canvas_scale;
+
+                        let item_rect = egui::Rect::from_min_size(
+                            egui::pos2(item_x, item_y),
+                            egui::vec2(item_w, item_h),
                         );
-                        ui.painter().rect_filled(live_rect, 4.0, egui::Color32::RED);
+
+                        // Draw source content - look up texture by SceneItemId
+                        if let Some(texture) = self.preview_textures.get(&id) {
+                            ui.painter().image(
+                                texture.id(),
+                                item_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            // Placeholder: draw colored rect with source name
+                            let color = if name.starts_with("Display Capture") {
+                                egui::Color32::from_rgb(40, 60, 80)
+                            } else {
+                                egui::Color32::from_rgb(60, 40, 80)
+                            };
+                            ui.painter().rect_filled(item_rect, 2.0, color);
+                            ui.painter().text(
+                                item_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                &name,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::LIGHT_GRAY,
+                            );
+                        }
+
+                        // Draw selection border
+                        ui.painter().rect_stroke(
+                            item_rect,
+                            2.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 120, 255)),
+                        );
+
+                        // Make item draggable
+                        let response = ui.interact(
+                            item_rect,
+                            ui.make_persistent_id(format!("source_item_{}", id.0 .0)),
+                            egui::Sense::drag(),
+                        );
+
+                        if response.dragged() {
+                            let drag_delta = response.drag_delta();
+                            let delta_scene_x = drag_delta.x / canvas_scale;
+                            let delta_scene_y = drag_delta.y / canvas_scale;
+
+                            if let Some(scene) = self.scenes.current_scene_mut() {
+                                if let Some(item) = scene.item_mut(id) {
+                                    let pos = item.position();
+                                    item.set_position(Position::new(
+                                        pos.x + delta_scene_x,
+                                        pos.y + delta_scene_y,
+                                    ));
+                                }
+                            }
+                        }
+
+                        // Draw resize handles at corners
+                        let handle_size = 8.0;
+                        let corners = [
+                            (item_rect.min, "tl"),
+                            (egui::pos2(item_rect.max.x, item_rect.min.y), "tr"),
+                            (egui::pos2(item_rect.min.x, item_rect.max.y), "bl"),
+                            (item_rect.max, "br"),
+                        ];
+
+                        for (corner, corner_name) in corners {
+                            let handle_rect = egui::Rect::from_center_size(
+                                corner,
+                                egui::vec2(handle_size, handle_size),
+                            );
+                            ui.painter()
+                                .rect_filled(handle_rect, 1.0, egui::Color32::WHITE);
+                            ui.painter().rect_stroke(
+                                handle_rect,
+                                1.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 120, 255)),
+                            );
+
+                            // Make corner handle draggable for resize
+                            let drag_response = ui.interact(
+                                handle_rect,
+                                ui.make_persistent_id(format!(
+                                    "resize_{}_{}",
+                                    id.0 .0, corner_name
+                                )),
+                                egui::Sense::drag(),
+                            );
+
+                            if drag_response.dragged() {
+                                let drag_delta = drag_response.drag_delta();
+                                let delta_w = drag_delta.x / canvas_scale;
+                                let delta_h = drag_delta.y / canvas_scale;
+
+                                if let Some(scene) = self.scenes.current_scene_mut() {
+                                    if let Some(item) = scene.item_mut(id) {
+                                        let scale = item.scale();
+                                        let new_sx = (scale.x + delta_w / src_w).max(0.01);
+                                        let new_sy = (scale.y + delta_h / src_h).max(0.01);
+                                        item.set_scale(Scale::new(new_sx, new_sy));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Draw source label
                         ui.painter().text(
-                            live_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "REC",
-                            egui::FontId::proportional(14.0),
-                            egui::Color32::WHITE,
+                            egui::pos2(item_rect.min.x, item_rect.min.y - 16.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            &name,
+                            egui::FontId::proportional(11.0),
+                            egui::Color32::from_rgb(180, 180, 180),
                         );
                     }
-                    // Show capture info
-                    let center = rect.center();
-                    ui.painter().text(
-                        center + egui::vec2(0.0, 20.0),
-                        egui::Align2::CENTER_CENTER,
-                        "Display Capture Active",
-                        egui::FontId::proportional(16.0),
-                        egui::Color32::LIGHT_GRAY,
-                    );
                 } else {
                     let center = rect.center();
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
-                        "No Source",
+                        "No Active Scene",
                         egui::FontId::proportional(24.0),
                         egui::Color32::GRAY,
                     );
+                }
+
+                // Show recording indicator
+                if self.recording {
+                    let live_rect = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(10.0, 10.0),
+                        egui::vec2(60.0, 25.0),
+                    );
+                    ui.painter().rect_filled(live_rect, 4.0, egui::Color32::RED);
                     ui.painter().text(
-                        center + egui::vec2(0.0, 40.0),
+                        live_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Click '+ Add Source' in Scenes to add Display Capture",
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::DARK_GRAY,
+                        "REC",
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
                     );
                 }
             });
@@ -1710,10 +2516,33 @@ impl RobsApp {
 impl eframe::App for RobsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
+
+        // Process preview frames
+        self.process_preview_frames(ctx);
+
+        // Manage preview capture based on source visibility
+        let has_monitor_source = self
+            .scenes
+            .current_scene()
+            .map(|s| {
+                s.items().iter().any(|i| {
+                    i.is_visible()
+                        && (i.name().starts_with("Window:")
+                            || i.name().starts_with("Display Capture"))
+                })
+            })
+            .unwrap_or(false);
+
+        if has_monitor_source && !self.preview_capture_active {
+            self.start_preview_capture();
+        } else if !has_monitor_source && self.preview_capture_active {
+            self.stop_preview_capture();
+        }
+
         self.menu_bar(ctx);
         self.streaming_controls(ctx);
-        self.sources_panel(ctx);
         self.scenes_panel(ctx);
+        self.source_properties_modal(ctx);
         self.preview_panel(ctx);
         self.right_panel(ctx);
 
