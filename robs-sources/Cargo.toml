@@ -14,3 +14,9 @@ tracing.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 async-trait.workspace = true
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }

@@ -1,0 +1,280 @@
+//! Native Windows capture using Win32 Window enumeration and GetWindowDC/BitBlt
+//! 
+//! This module provides screen capture using Windows APIs:
+//! - Win32 EnumWindows for enumerating open windows
+//! - GDI BitBlt for capturing window content
+
+use anyhow::Result;
+use async_trait::async_trait;
+use robs_core::traits::*;
+use robs_core::*;
+use std::any::Any;
+use std::sync::Mutex;
+use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+/// Window info for enumeration
+#[derive(Clone, Debug)]
+pub struct WindowInfo {
+    pub hwnd: isize,
+    pub title: String,
+    pub process_id: u32,
+}
+
+// Global storage for window enumeration
+static ENUM_WINDOWS: Mutex<Vec<WindowInfo>> = Mutex::new(Vec::new());
+
+/// Get list of open windows using Win32 EnumWindows
+pub fn get_open_windows() -> Vec<WindowInfo> {
+    // Clear the global storage
+    {
+        let mut windows = ENUM_WINDOWS.lock().unwrap();
+        windows.clear();
+    }
+    
+    unsafe {
+        // Use EnumWindows with a static callback
+        let _ = EnumWindows(Some(enum_windows_callback), LPARAM(0));
+    }
+    
+    // Get the collected windows
+    let mut windows = ENUM_WINDOWS.lock().unwrap();
+    let result = windows.clone();
+    windows.clear();
+    result
+}
+
+// Callback function for EnumWindows (must be a function, not a closure)
+unsafe extern "system" fn enum_windows_callback(hwnd: HWND, _: LPARAM) -> BOOL {
+    // Check if window is visible
+    let is_visible: BOOL = IsWindowVisible(hwnd);
+    if is_visible.0 == 0 {
+        return BOOL(1); // Continue enumeration
+    }
+    
+    // Get window title
+    let mut title_buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, &mut title_buf);
+    if len == 0 {
+        return BOOL(1); // Continue
+    }
+    
+    let title = String::from_utf16_lossy(&title_buf[..len as usize]);
+    if title.is_empty() {
+        return BOOL(1); // Continue
+    }
+    
+    // Get process ID
+    let mut process_id: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    
+    // Skip some system windows
+    if title.starts_with("Windows ")
+        || title.starts_with("Program Manager")
+        || process_id == 0
+    {
+        return BOOL(1); // Continue
+    }
+    
+    // Add to global storage
+    if let Ok(mut windows) = ENUM_WINDOWS.lock() {
+        windows.push(WindowInfo {
+            hwnd: hwnd.0 as isize,
+            title,
+            process_id,
+        });
+    }
+    
+    BOOL(1) // Continue enumeration
+}
+
+/// Window capture source using window handle
+pub struct WindowCaptureSource {
+    id: SourceId,
+    name: String,
+    hwnd: isize,
+    active: bool,
+    video_info: VideoInfo,
+    frame_count: u64,
+}
+
+impl WindowCaptureSource {
+    pub fn new(name: String, hwnd: isize) -> Self {
+        Self {
+            id: SourceId(ObjectId::new()),
+            name,
+            hwnd,
+            active: false,
+            video_info: VideoInfo {
+                width: 1920,
+                height: 1080,
+                fps_num: 30,
+                fps_den: 1,
+                format: PixelFormat::BGRA,
+                range: VideoRange::Full,
+                color_space: ColorSpace::SRGB,
+            },
+            frame_count: 0,
+        }
+    }
+    
+    /// Capture a frame from the window using GDI
+    fn capture_frame(&mut self) -> Result<VideoFrame> {
+        unsafe {
+            let hwnd = HWND(self.hwnd as *mut std::ffi::c_void);
+            
+            // Get window rect
+            let mut rect = RECT::default();
+            let rect_ok = GetWindowRect(hwnd, &mut rect);
+            if rect_ok.is_err() {
+                anyhow::bail!("Failed to get window rect");
+            }
+            
+            let width = (rect.right - rect.left) as u32;
+            let height = (rect.bottom - rect.top) as u32;
+            
+            if width == 0 || height == 0 {
+                anyhow::bail!("Window has zero size");
+            }
+            
+            // Get window DC
+            let hdc = GetWindowDC(hwnd);
+            if hdc.is_invalid() {
+                anyhow::bail!("Failed to get DC");
+            }
+            
+            // Create compatible DC and bitmap
+            let mem_dc = CreateCompatibleDC(hdc);
+            let bitmap = CreateCompatibleBitmap(hdc, width as i32, height as i32);
+            let old_bitmap = SelectObject(mem_dc, bitmap);
+            
+            // BitBlt the window content
+            let bitblt_ok = BitBlt(
+                mem_dc,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                hdc,
+                0,
+                0,
+                SRCCOPY,
+            );
+            
+            // Get the bitmap data
+            if bitblt_ok.is_ok() {
+                let mut bmi = BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32), // Top-down
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                };
+                
+                let mut buffer = vec![0u8; (width * height * 4) as usize];
+                let got_bits = GetDIBits(
+                    mem_dc,
+                    bitmap,
+                    0,
+                    height,
+                    Some(buffer.as_mut_ptr() as *mut _),
+                    &mut bmi as *mut _ as *mut BITMAPINFO,
+                    DIB_RGB_COLORS,
+                );
+                
+                // Cleanup
+                let _ = SelectObject(mem_dc, old_bitmap);
+                let _ = DeleteObject(bitmap);
+                let _ = DeleteDC(mem_dc);
+                let _ = ReleaseDC(hwnd, hdc);
+                
+                if got_bits == 0 {
+                    anyhow::bail!("Failed to get bitmap bits");
+                }
+                
+                self.frame_count += 1;
+                let pts = (self.frame_count * 1000 / 30) as i64;
+                
+                // Update video info
+                self.video_info.width = width;
+                self.video_info.height = height;
+                
+                return Ok(VideoFrame {
+                    width,
+                    height,
+                    format: PixelFormat::BGRA,
+                    data: buffer,
+                    pts,
+                    duration: 33333,
+                    linesize: vec![(width * 4) as usize],
+                });
+            }
+            
+            // Cleanup on failure
+            let _ = SelectObject(mem_dc, old_bitmap);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(hwnd, hdc);
+            
+            anyhow::bail!("BitBlt failed");
+        }
+    }
+}
+
+#[async_trait]
+impl Source for WindowCaptureSource {
+    fn id(&self) -> SourceId { self.id }
+    fn name(&self) -> &str { &self.name }
+    fn set_name(&mut self, name: String) { self.name = name; }
+    fn get_video_info(&self) -> Option<VideoInfo> { Some(self.video_info.clone()) }
+    fn get_audio_info(&self) -> Option<AudioInfo> { None }
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    
+    async fn activate(&mut self) -> Result<()> {
+        self.active = true;
+        self.frame_count = 0;
+        println!("[WindowCapture] Activated window: {}", self.name);
+        Ok(())
+    }
+    
+    async fn deactivate(&mut self) -> Result<()> {
+        self.active = false;
+        println!("[WindowCapture] Deactivated window: {}", self.name);
+        Ok(())
+    }
+    
+    fn is_active(&self) -> bool { self.active }
+    
+    fn properties_definition(&self) -> Vec<PropertyDef> {
+        vec![]
+    }
+    
+    fn get_property(&self, _name: &str) -> Option<PropertyValue> {
+        None
+    }
+    
+    fn set_property(&mut self, _name: &str, _value: PropertyValue) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl VideoSource for WindowCaptureSource {
+    async fn get_frame(&mut self) -> Result<Option<VideoFrame>> {
+        if !self.active {
+            return Ok(None);
+        }
+        
+        match self.capture_frame() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(e) => {
+                println!("[WindowCapture] Error capturing frame: {}", e);
+                Ok(None)
+            }
+        }
+    }
+}
