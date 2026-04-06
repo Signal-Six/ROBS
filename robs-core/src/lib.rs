@@ -5,6 +5,7 @@ pub mod pipeline;
 pub mod event;
 pub mod registry;
 pub mod context;
+pub mod scene;
 
 pub use types::*;
 pub use traits::*;
@@ -13,6 +14,7 @@ pub use pipeline::*;
 pub use event::*;
 pub use registry::*;
 pub use context::*;
+pub use scene::*;
 
 pub const ROBS_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ROBS_NAME: &str = "ROBS";
