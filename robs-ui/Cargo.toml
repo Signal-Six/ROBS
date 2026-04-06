@@ -20,6 +20,7 @@ serde.workspace = true
 chrono.workspace = true
 rfd = "0.15"
 image = "0.25"
+dxgi-capture-rs = "1.2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -28,6 +29,7 @@ windows = { version = "0.58", features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
+dxgi-capture-rs = "1.2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

@@ -280,12 +280,14 @@ pub struct RobsApp {
     active_video_source: Option<Box<dyn VideoSource>>,
     preview_textures: HashMap<SceneItemId, egui::TextureHandle>, // One texture per source
     frame_buffer: HashMap<String, Vec<u8>>,
+    // DX11 Desktop Duplication capture (GPU-accelerated)
+    dxgi_capture: HashMap<u32, dxgi_capture_rs::DXGIManager>, // monitor_index -> DXGIManager
     // Real-time preview capture (per-source tracking)
     preview_capture_active: bool,
     preview_frame_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     preview_capture_handle: Option<std::process::Child>, // Store FFmpeg process for preview
     preview_frame_receiver: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-    // Native preview capture state
+    // Native preview capture state (GDI fallback)
     preview_hwnd: Option<isize>, // Window handle for native preview capture
     preview_frame_count: u64,
     // Source properties modal state
@@ -341,6 +343,25 @@ fn parse_monitor_coords(source_name: &str) -> (i32, i32, i32, i32) {
     }
 
     (cap_x, cap_y, cap_w, cap_h)
+}
+
+/// Parse monitor index from a display capture source name
+/// Format: "Display Capture - Name|idx:X|x:Y|y:Z|w:W|h:H"
+/// Returns monitor index (0 = primary, 1+ = secondary)
+fn parse_monitor_index(source_name: &str) -> u32 {
+    if let Some(pipe_pos) = source_name.find('|') {
+        let params = &source_name[pipe_pos + 1..];
+        for param in params.split('|') {
+            if let Some(colon_pos) = param.find(':') {
+                let key = &param[..colon_pos];
+                let value = &param[colon_pos + 1..];
+                if key == "idx" {
+                    return value.parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+    0 // Default to primary monitor
 }
 
 impl RobsApp {
@@ -460,12 +481,14 @@ impl RobsApp {
             active_video_source: None,
             preview_textures: HashMap::new(),
             frame_buffer: HashMap::new(),
+            // DX11 Desktop Duplication capture
+            dxgi_capture: HashMap::new(),
             // Real-time preview
             preview_capture_active: false,
             preview_frame_sender: None,
             preview_capture_handle: None,
             preview_frame_receiver: None,
-            // Native preview capture
+            // Native preview capture (GDI fallback)
             preview_hwnd: None,
             preview_frame_count: 0,
             // Source properties modal
@@ -1040,90 +1063,52 @@ impl RobsApp {
         }
     }
 
-    /// Capture a specific monitor region using GDI
-    /// x, y are in virtual screen coordinates
-    fn capture_desktop_frame(
-        &self,
-        cap_x: i32,
-        cap_y: i32,
-        cap_w: i32,
-        cap_h: i32,
-    ) -> Option<(Vec<u8>, u32, u32)> {
-        unsafe {
-            // Get DC for the entire virtual screen (all monitors)
-            let hdc_screen = GetDC(HWND(std::ptr::null_mut()));
-            if hdc_screen.is_invalid() {
-                return None;
-            }
-
-            let width = cap_w as u32;
-            let height = cap_h as u32;
-
-            if width == 0 || height == 0 {
-                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
-                return None;
-            }
-
-            // Create compatible DC and bitmap
-            let mem_dc = CreateCompatibleDC(hdc_screen);
-            let bitmap = CreateCompatibleBitmap(hdc_screen, cap_w, cap_h);
-            let old_bitmap = SelectObject(mem_dc, bitmap);
-
-            // BitBlt from screen to memory DC at the specified region
-            let bitblt_ok = BitBlt(
-                mem_dc,
-                0,
-                0,
-                cap_w,
-                cap_h,
-                hdc_screen,
-                cap_x,
-                cap_y,
-                SRCCOPY | CAPTUREBLT,
+    /// Capture a specific monitor using DXGI Desktop Duplication (DX11-based, GPU-accelerated)
+    /// monitor_index: 0 = primary, 1+ = secondary monitors
+    fn capture_desktop_frame(&mut self, monitor_index: u32) -> Option<(Vec<u8>, u32, u32)> {
+        // Get or create DXGIManager for this monitor
+        let manager = self.dxgi_capture.entry(monitor_index).or_insert_with(|| {
+            eprintln!(
+                "[DX11] Creating DXGI Desktop Duplication for monitor {}",
+                monitor_index
             );
+            dxgi_capture_rs::DXGIManager::new(16) // 16ms timeout (~60fps)
+                .expect("Failed to create DXGIManager - Desktop Duplication may not be supported")
+        });
 
-            if bitblt_ok.is_ok() {
-                let mut bmi = BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: cap_w,
-                    biHeight: -(cap_h), // Top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                };
+        // Set the capture source to the correct monitor
+        manager.set_capture_source_index(monitor_index as usize);
 
-                let mut buffer = vec![0u8; (width * height * 4) as usize];
-                let got_bits = GetDIBits(
-                    mem_dc,
-                    bitmap,
-                    0,
-                    cap_h as u32,
-                    Some(buffer.as_mut_ptr() as *mut _),
-                    &mut bmi as *mut _ as *mut BITMAPINFO,
-                    DIB_RGB_COLORS,
-                );
-
-                // Cleanup
-                let _ = SelectObject(mem_dc, old_bitmap);
-                let _ = DeleteObject(bitmap);
-                let _ = DeleteDC(mem_dc);
-                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
-
-                if got_bits == 0 {
-                    return None;
-                }
-
-                return Some((buffer, width, height));
+        // Capture frame via DXGI (GPU-accelerated, returns BGRA8 pixels)
+        match manager.capture_frame() {
+            Ok((pixels, (width, height))) => {
+                // Convert BGRA8 to raw bytes (BGRA8 is already in BGRA byte order)
+                let data: Vec<u8> = pixels
+                    .into_iter()
+                    .flat_map(|p| [p.b, p.g, p.r, p.a])
+                    .collect();
+                Some((data, width as u32, height as u32))
             }
-
-            // Cleanup on failure
-            let _ = SelectObject(mem_dc, old_bitmap);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(mem_dc);
-            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
-
-            None
+            Err(dxgi_capture_rs::CaptureError::Timeout) => {
+                // No new frame available - normal occurrence
+                None
+            }
+            Err(dxgi_capture_rs::CaptureError::AccessLost) => {
+                // Display mode changed - recreate manager
+                eprintln!(
+                    "[DX11] Access lost for monitor {}, recreating manager",
+                    monitor_index
+                );
+                self.dxgi_capture.remove(&monitor_index);
+                None
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DX11] Capture error for monitor {}: {:?}",
+                    monitor_index, e
+                );
+                None
+            }
         }
     }
 
@@ -1172,12 +1157,11 @@ impl RobsApp {
                     "[Preview] Window capture preview pending (HWND not stored in scene item)"
                 );
             } else if item_name.starts_with("Display Capture") {
-                // Display capture - parse monitor coordinates from source name
-                let (cap_x, cap_y, cap_w, cap_h) = parse_monitor_coords(item_name);
+                // Display capture - parse monitor index from source name
+                // Format: "Display Capture - Name|idx:X|x:Y|y:Z|w:W|h:H"
+                let monitor_index = parse_monitor_index(item_name);
 
-                if let Some((data, width, height)) =
-                    self.capture_desktop_frame(cap_x, cap_y, cap_w, cap_h)
-                {
+                if let Some((data, width, height)) = self.capture_desktop_frame(monitor_index) {
                     // Scale to output resolution
                     let scaled_data = self.scale_frame_to_output(
                         &data,
