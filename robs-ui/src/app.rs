@@ -1,15 +1,16 @@
+use crate::dxgi_capture::DxgiCaptureManager;
 use eframe::egui;
 use parking_lot::RwLock;
 use robs_chat::aggregator::ChatAggregator;
 use robs_chat::message::{ChatEvent, UnifiedChatMessage};
-use robs_core::scene::{Alignment, Crop, Position, Scale, Scene};
+use robs_core::scene::{Crop, Position, Scale};
 use robs_core::traits::VideoSource;
 use robs_core::types::{SceneItemId, SourceId};
 use robs_core::SceneCollection;
 use robs_encoding::detect_encoders;
 use robs_outputs::FileOutput;
 use robs_profiles::profile::ProfileManager;
-use robs_sources::native_capture::{get_open_windows, WindowCaptureSource};
+use robs_sources::native_capture::get_open_windows;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs;
@@ -17,9 +18,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[derive(Clone)]
 struct MonitorInfo {
@@ -276,21 +274,25 @@ pub struct RobsApp {
     recording_start_time: Option<u64>,
     last_recording_path: String,
     ffmpeg_recording_handle: Option<std::process::Child>, // Store FFmpeg process handle for graceful shutdown
+    recording_dxgi_thread: Option<std::thread::JoinHandle<()>>, // DXGI capture thread for recording
+    recording_stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>, // Signal to stop DXGI thread
+    recording_frame_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>, // Channel to send frames to FFmpeg
+    recording_ffmpeg_stdin: Option<std::process::ChildStdin>,         // FFmpeg stdin handle
     // Video capture / Preview
     active_video_source: Option<Box<dyn VideoSource>>,
     preview_textures: HashMap<SceneItemId, egui::TextureHandle>, // One texture per source
     frame_buffer: HashMap<String, Vec<u8>>,
-    // DX11 Desktop Duplication capture (GPU-accelerated)
-    dxgi_capture: HashMap<u32, dxgi_capture_rs::DXGIManager>, // monitor_index -> DXGIManager
-    dxgi_failed_monitors: std::collections::HashSet<u32>, // Monitors where DXGI init failed (cache to avoid retry spam)
+    // Direct DXGI Desktop Duplication capture (GPU-accelerated)
+    // Replaces dxgi-capture-rs with direct implementation for full monitor control
+    dxgi_manager: Option<DxgiCaptureManager>, // Our own DXGI capture manager
     // Real-time preview capture (per-source tracking)
     preview_capture_active: bool,
     preview_frame_sender: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     preview_capture_handle: Option<std::process::Child>, // Store FFmpeg process for preview
     preview_frame_receiver: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
-    // Native preview capture state (GDI fallback)
-    preview_hwnd: Option<isize>, // Window handle for native preview capture
+    // Native preview capture state
     preview_frame_count: u64,
+    last_preview_capture: std::time::Instant,
     // Source properties modal state
     show_source_properties: bool,
     editing_source_id: Option<SceneItemId>,
@@ -479,20 +481,23 @@ impl RobsApp {
             recording_start_time: None,
             last_recording_path: String::new(),
             ffmpeg_recording_handle: None,
+            recording_dxgi_thread: None,
+            recording_stop_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            recording_frame_sender: None,
+            recording_ffmpeg_stdin: None,
             active_video_source: None,
             preview_textures: HashMap::new(),
             frame_buffer: HashMap::new(),
-            // DX11 Desktop Duplication capture
-            dxgi_capture: HashMap::new(),
-            dxgi_failed_monitors: std::collections::HashSet::new(),
+            // Direct DXGI Desktop Duplication capture
+            dxgi_manager: None, // Initialized lazily on first capture
             // Real-time preview
             preview_capture_active: false,
             preview_frame_sender: None,
             preview_capture_handle: None,
             preview_frame_receiver: None,
-            // Native preview capture (GDI fallback)
-            preview_hwnd: None,
+            // Native preview capture
             preview_frame_count: 0,
+            last_preview_capture: std::time::Instant::now(),
             // Source properties modal
             show_source_properties: false,
             editing_source_id: None,
@@ -599,29 +604,18 @@ impl RobsApp {
                         .find(|i| i.is_visible() && i.name().starts_with("Display Capture"));
 
                     if let Some(item) = monitor_item {
-                        // Parse device_id from item name or default to 0
-                        let device_id = if item.name().contains("Monitor 2") {
-                            1u32
-                        } else {
-                            0u32
-                        };
+                        // Use position coordinates from the source name
+                        // Format: "Display Capture - Name|idx:X|x:Y|y:Z|w:W|h:H"
+                        let (mon_x, mon_y, mon_w, mon_h) = parse_monitor_coords(item.name());
 
                         eprintln!("[Recording] Found monitor_capture source: {}", item.name());
-
-                        let monitors = get_monitors();
-                        let monitor = monitors.get(device_id as usize);
+                        eprintln!(
+                            "[Recording] Using monitor at ({},{}) - {}x{}",
+                            mon_x, mon_y, mon_w, mon_h
+                        );
 
                         let input = "desktop".to_string();
-                        let (ox, oy, width, height) = monitor
-                            .map(|m| {
-                                eprintln!(
-                                    "[Recording] Selected monitor: {} {}x{} at ({},{})",
-                                    m.name, m.width, m.height, m.position_x, m.position_y
-                                );
-                                (m.position_x, m.position_y, m.width, m.height)
-                            })
-                            .unwrap_or((0, 0, 1920, 1080));
-                        (input, ox, oy, width, height, false)
+                        (input, mon_x, mon_y, mon_w, mon_h, false)
                     } else {
                         eprintln!("[Recording] No capture source found in scene!");
                         ("desktop".to_string(), 0, 0, 1920, 1080, false)
@@ -655,95 +649,68 @@ impl RobsApp {
         let format = self.recording_format.clone();
         let mut ffmpeg_args = Vec::new();
 
-        // Input: capture based on source type
-        ffmpeg_args.push("-f".into());
-        ffmpeg_args.push("gdigrab".into());
-        ffmpeg_args.push("-framerate".into());
-        ffmpeg_args.push("30".into());
-        ffmpeg_args.push("-draw_mouse".into());
-        ffmpeg_args.push("1".into());
+        // Check if we're doing monitor capture via DXGI (no gdigrab)
+        let use_dxgi_recording = !use_window_capture;
 
-        if use_window_capture {
-            // Window capture - don't set offset or size, let FFmpeg auto-detect
-            ffmpeg_args.push("-i".into());
-            ffmpeg_args.push(input_spec.clone()); // "title=Window Name"
-        } else {
-            // Monitor capture
-            ffmpeg_args.push("-offset_x".into());
-            ffmpeg_args.push(offset_x.to_string());
-            ffmpeg_args.push("-offset_y".into());
-            ffmpeg_args.push(offset_y.to_string());
+        if use_dxgi_recording {
+            // DXGI recording: pipe raw frames via stdin
+            // Frames are already scaled to output resolution on the main thread
+            let output_w = self.output_width;
+            let output_h = self.output_height;
+
+            eprintln!(
+                "[Recording] Using DXGI recording pipeline: sending {}x{} frames to FFmpeg",
+                output_w, output_h
+            );
+
+            // Tell FFmpeg to expect raw BGRA frames at OUTPUT resolution (already scaled)
+            ffmpeg_args.push("-f".into());
+            ffmpeg_args.push("rawvideo".into());
+            ffmpeg_args.push("-pix_fmt".into());
+            ffmpeg_args.push("bgra".into());
             ffmpeg_args.push("-video_size".into());
-            ffmpeg_args.push(format!("{}x{}", final_width, final_height));
+            ffmpeg_args.push(format!("{}x{}", output_w, output_h));
+            ffmpeg_args.push("-framerate".into());
+            ffmpeg_args.push(self.fps_setting.to_string());
             ffmpeg_args.push("-i".into());
-            ffmpeg_args.push(input_spec.clone());
-        }
-
-        // Get desktop audio and mic/aux device settings
-        let desktop_audio_device = self
-            .audio_channels
-            .iter()
-            .find(|ch| ch.is_desktop)
-            .map(|ch| ch.device_id.clone())
-            .unwrap_or_else(|| "disabled".to_string());
-
-        let mic_audio_device = self
-            .audio_channels
-            .iter()
-            .find(|ch| !ch.is_desktop)
-            .map(|ch| ch.device_id.clone())
-            .unwrap_or_else(|| "disabled".to_string());
-
-        eprintln!("[Recording] Desktop audio device: {}", desktop_audio_device);
-        eprintln!("[Recording] Mic/Aux audio device: {}", mic_audio_device);
-
-        // Add desktop audio (system audio) if not disabled
-        // Map "default" to a valid device if needed
-        if desktop_audio_device != "disabled" {
-            let audio_input = if desktop_audio_device == "default" {
-                // Default: try to use GoXLR Broadcast Stream Mix
-                "audio=Broadcast Stream Mix (TC-HELICON GoXLR)".to_string()
-            } else if desktop_audio_device.starts_with("audio=") {
-                // Already has audio= prefix, use as-is
-                desktop_audio_device.clone()
-            } else {
-                // Add prefix if missing
-                format!("audio={}", desktop_audio_device)
-            };
-            eprintln!("[Recording] Using desktop audio input: {}", audio_input);
+            ffmpeg_args.push("pipe:0".into());
+        } else {
+            // Window capture fallback: use gdigrab
             ffmpeg_args.push("-f".into());
-            ffmpeg_args.push("dshow".into());
-            ffmpeg_args.push("-i".into());
-            ffmpeg_args.push(audio_input);
+            ffmpeg_args.push("gdigrab".into());
+            ffmpeg_args.push("-framerate".into());
+            ffmpeg_args.push(self.fps_setting.to_string());
+            ffmpeg_args.push("-draw_mouse".into());
+            ffmpeg_args.push("1".into());
+
+            if use_window_capture {
+                ffmpeg_args.push("-i".into());
+                ffmpeg_args.push(input_spec.clone());
+            } else {
+                ffmpeg_args.push("-offset_x".into());
+                ffmpeg_args.push(offset_x.to_string());
+                ffmpeg_args.push("-offset_y".into());
+                ffmpeg_args.push(offset_y.to_string());
+                ffmpeg_args.push("-video_size".into());
+                ffmpeg_args.push(format!("{}x{}", final_width, final_height));
+                ffmpeg_args.push("-i".into());
+                ffmpeg_args.push(input_spec.clone());
+            }
         }
 
-        // Add mic/aux audio if not disabled and different from desktop
-        if mic_audio_device != "disabled" && mic_audio_device != desktop_audio_device {
-            let audio_input = if mic_audio_device == "default" {
-                // Default: try to use GoXLR Chat Mic
-                "audio=Chat Mic (TC-HELICON GoXLR)".to_string()
-            } else if mic_audio_device.starts_with("audio=") {
-                mic_audio_device.clone()
-            } else {
-                format!("audio={}", mic_audio_device)
-            };
-            eprintln!("[Recording] Using mic audio input: {}", audio_input);
-            ffmpeg_args.push("-f".into());
-            ffmpeg_args.push("dshow".into());
-            ffmpeg_args.push("-i".into());
-            ffmpeg_args.push(audio_input);
-        }
+        // NOTE: Audio disabled for now - dshow audio is a live stream that never ends,
+        // causing FFmpeg to hang indefinitely. Will re-add with proper -shortest handling.
 
         // Video codec
         ffmpeg_args.push("-c:v".into());
         ffmpeg_args.push(encoder.to_string());
 
-        // NVENC-specific settings
+        // NVENC-specific settings (matching OBS: CBR, HQ tuning, 2-pass)
         if encoder == "h264_nvenc" {
             ffmpeg_args.push("-preset".into());
             ffmpeg_args.push("p4".into());
             ffmpeg_args.push("-tune".into());
-            ffmpeg_args.push("ll".into());
+            ffmpeg_args.push("hq".into()); // High Quality (OBS default, not low-latency)
             ffmpeg_args.push("-gpu".into());
             ffmpeg_args.push("0".into());
             ffmpeg_args.push("-rc".into());
@@ -754,6 +721,13 @@ impl RobsApp {
             ffmpeg_args.push(format!("{}k", self.recording_bitrate));
             ffmpeg_args.push("-bufsize".into());
             ffmpeg_args.push(format!("{}k", self.recording_bitrate * 2));
+            // Keyframe interval (gop size = fps * keyframe_interval)
+            let gop_size = (self.fps_setting * self.keyframe_interval as f32) as u32;
+            ffmpeg_args.push("-g".into());
+            ffmpeg_args.push(gop_size.to_string());
+            // Two-pass multipass encoding (quarter resolution for first pass)
+            ffmpeg_args.push("-multipass".into());
+            ffmpeg_args.push("fullres".into());
         } else {
             // x264 settings
             ffmpeg_args.push("-preset".into());
@@ -764,27 +738,9 @@ impl RobsApp {
             ffmpeg_args.push("23".into());
         }
 
-        // Add audio codec if we have audio inputs
-        let has_audio = desktop_audio_device != "disabled" || mic_audio_device != "disabled";
-        if has_audio {
-            // Use AAC for audio encoding
-            ffmpeg_args.push("-c:a".into());
-            ffmpeg_args.push("aac".into());
-            ffmpeg_args.push("-b:a".into());
-            ffmpeg_args.push("192k".into());
-            // Sample rate
-            ffmpeg_args.push("-ar".into());
-            ffmpeg_args.push(self.audio_sample_rate.clone());
-            // Channel mode (mono/stereo)
-            if self.audio_channel_mode == "mono" {
-                ffmpeg_args.push("-ac".into());
-                ffmpeg_args.push("1".into());
-            }
-        }
-
         // Frame rate
         ffmpeg_args.push("-r".into());
-        ffmpeg_args.push("30".into());
+        ffmpeg_args.push(self.fps_setting.to_string());
 
         // Output format and overwrite
         if format == "mp4" {
@@ -818,6 +774,83 @@ impl RobsApp {
                     pid, output_path
                 );
 
+                // For DXGI recording: spawn a thread to capture frames and pipe to FFmpeg
+                if use_dxgi_recording {
+                    let stop_flag = self.recording_stop_flag.clone();
+                    let position = (offset_x, offset_y);
+                    let input_width = video_width as u32;
+                    let input_height = video_height as u32;
+                    let fps = self.fps_setting;
+
+                    // For DXGI recording: spawn a writer thread that reads frames from a channel
+                    // and pipes them to FFmpeg stdin. The main thread captures frames via existing DXGI.
+                    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                    self.recording_frame_sender = Some(tx);
+
+                    let stop_flag = self.recording_stop_flag.clone();
+                    let stdin = child.stdin.take().expect("FFmpeg stdin should be piped");
+                    let output_w = self.output_width;
+                    let output_h = self.output_height;
+                    let needs_scaling =
+                        video_width as u32 != output_w || video_height as u32 != output_h;
+
+                    eprintln!(
+                        "[Recording] Starting FFmpeg stdin writer thread (scaling: {}, output: {}x{})",
+                        needs_scaling, output_w, output_h
+                    );
+
+                    let thread_handle = std::thread::spawn(move || {
+                        let mut stdin = stdin;
+                        let mut frame_count: u64 = 0;
+                        let mut total_bytes: u64 = 0;
+
+                        while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                                Ok(frame_data) => {
+                                    let bytes = frame_data.len();
+                                    total_bytes += bytes as u64;
+
+                                    if let Err(e) =
+                                        std::io::Write::write_all(&mut stdin, &frame_data)
+                                    {
+                                        eprintln!(
+                                            "[DXGI-Record] Failed to write frame to FFmpeg: {}",
+                                            e
+                                        );
+                                        break;
+                                    }
+                                    frame_count += 1;
+                                    if frame_count % 10 == 0 {
+                                        eprintln!(
+                                            "[DXGI-Record] Written {} frames to FFmpeg ({} MB total)",
+                                            frame_count,
+                                            total_bytes / (1024 * 1024)
+                                        );
+                                    }
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    continue;
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    eprintln!("[DXGI-Record] Channel disconnected, exiting");
+                                    break;
+                                }
+                            }
+                        }
+
+                        eprintln!(
+                            "[DXGI-Record] Writer thread exiting after {} frames ({} MB)",
+                            frame_count,
+                            total_bytes / (1024 * 1024)
+                        );
+                    });
+
+                    self.recording_dxgi_thread = Some(thread_handle);
+                } else {
+                    // Non-DXGI recording: just drop stdin (gdigrab doesn't need it)
+                    drop(child.stdin.take());
+                }
+
                 // Try to read initial stderr output to check for errors
                 if let Some(stderr) = child.stderr.take() {
                     use std::io::{BufRead, BufReader};
@@ -835,7 +868,12 @@ impl RobsApp {
                 }
 
                 // Store the handle for graceful shutdown
+                eprintln!("[Recording] Storing FFmpeg handle, PID: {}", child.id());
                 self.ffmpeg_recording_handle = Some(child);
+                eprintln!(
+                    "[Recording] Handle stored: {:?}",
+                    self.ffmpeg_recording_handle.is_some()
+                );
             }
             Err(e) => {
                 println!("[Recording] Failed to start FFmpeg: {}", e);
@@ -852,61 +890,59 @@ impl RobsApp {
     }
 
     fn stop_recording(&mut self) {
-        // Try graceful shutdown first - send 'q' to FFmpeg's stdin
+        eprintln!("[Recording] Stopping recording...");
+
+        // 1. Signal the writer thread to stop
+        self.recording_stop_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // 2. Drop the sender to close the channel - this signals the writer thread
+        self.recording_frame_sender = None;
+
+        // 3. Wait for the writer thread to finish (it will drop FFmpeg stdin = EOF)
+        if let Some(handle) = self.recording_dxgi_thread.take() {
+            eprintln!("[Recording] Waiting for writer thread to exit...");
+            let _ = handle.join();
+            eprintln!("[Recording] Writer thread stopped");
+        }
+
+        // 4. Wait for FFmpeg to finalize the file after stdin EOF
+        // Since we removed audio, FFmpeg should exit quickly after video EOF
         if let Some(mut child) = self.ffmpeg_recording_handle.take() {
-            println!("[Recording] Requesting graceful FFmpeg shutdown...");
+            eprintln!("[Recording] Waiting for FFmpeg to finalize...");
 
-            // Write 'q' to stdin to request graceful shutdown
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                if stdin.write_all(b"q").is_ok() {
-                    println!("[Recording] Sent quit command to FFmpeg");
-                }
-            }
-
-            // Wait for the process to exit (with timeout)
-            let timeout = std::time::Duration::from_secs(5);
+            let timeout = std::time::Duration::from_secs(10);
             let start = std::time::Instant::now();
 
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        println!("[Recording] FFmpeg exited with: {}", status);
+                        eprintln!("[Recording] FFmpeg exited with: {}", status);
                         break;
                     }
                     Ok(None) => {
                         if start.elapsed() > timeout {
-                            println!("[Recording] Timeout waiting for FFmpeg, forcing kill...");
+                            eprintln!("[Recording] FFmpeg timeout, forcing kill...");
                             let _ = std::process::Command::new("taskkill")
                                 .args(["/IM", "ffmpeg.exe", "/F"])
                                 .output();
                             break;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                     Err(e) => {
-                        println!("[Recording] Error waiting for FFmpeg: {}", e);
+                        eprintln!("[Recording] Error waiting for FFmpeg: {}", e);
                         break;
                     }
                 }
             }
-        } else {
-            // Fallback: use taskkill if no handle stored
-            println!("[Recording] No stored handle, using taskkill fallback...");
-            let _ = std::process::Command::new("taskkill")
-                .args(["/IM", "ffmpeg.exe", "/T", "/F"])
-                .output();
-
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            let _ = std::process::Command::new("taskkill")
-                .args(["/IM", "ffmpeg.exe", "/F"])
-                .output();
         }
 
-        // Wait a bit more for file to be finalized
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
+        // 5. Reset state for next recording session
+        self.recording_stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.recording_dxgi_thread = None;
+        self.recording_frame_sender = None;
+        self.ffmpeg_recording_handle = None;
         self.recording = false;
         let elapsed = self.recording_start_time.map(|start| {
             std::time::SystemTime::now()
@@ -965,262 +1001,122 @@ impl RobsApp {
         }
 
         self.preview_capture_active = false;
-        self.preview_hwnd = None;
         eprintln!("[Preview] Preview capture stopped");
     }
 
-    /// Capture a frame from the window using GDI (native Windows API)
-    fn capture_native_frame(&mut self) -> Option<(Vec<u8>, u32, u32)> {
-        let hwnd = self.preview_hwnd?;
-
-        unsafe {
-            let hwnd = HWND(hwnd as *mut std::ffi::c_void);
-
-            // Get client rect (interior content, not window border)
-            let mut client_rect = RECT::default();
-            let rect_ok = GetClientRect(hwnd, &mut client_rect);
-            if rect_ok.is_err() {
-                return None;
-            }
-
-            let width = client_rect.right - client_rect.left;
-            let height = client_rect.bottom - client_rect.top;
-
-            if width <= 0 || height <= 0 {
-                return None;
-            }
-
-            let width = width as u32;
-            let height = height as u32;
-
-            // Get client DC (captures interior content, not frame)
-            let hdc = GetDC(hwnd);
-            if hdc.is_invalid() {
-                return None;
-            }
-
-            // Create compatible DC and bitmap
-            let mem_dc = CreateCompatibleDC(hdc);
-            let bitmap = CreateCompatibleBitmap(hdc, width as i32, height as i32);
-            let old_bitmap = SelectObject(mem_dc, bitmap);
-
-            // BitBlt the client content
-            let bitblt_ok = BitBlt(
-                mem_dc,
-                0,
-                0,
-                width as i32,
-                height as i32,
-                hdc,
-                0,
-                0,
-                SRCCOPY,
-            );
-
-            // Get the bitmap data
-            if bitblt_ok.is_ok() {
-                let mut bmi = BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width as i32,
-                    biHeight: -(height as i32), // Top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                };
-
-                let mut buffer = vec![0u8; (width * height * 4) as usize];
-                let got_bits = GetDIBits(
-                    mem_dc,
-                    bitmap,
-                    0,
-                    height,
-                    Some(buffer.as_mut_ptr() as *mut _),
-                    &mut bmi as *mut _ as *mut BITMAPINFO,
-                    DIB_RGB_COLORS,
-                );
-
-                // Cleanup
-                let _ = SelectObject(mem_dc, old_bitmap);
-                let _ = DeleteObject(bitmap);
-                let _ = DeleteDC(mem_dc);
-                let _ = ReleaseDC(hwnd, hdc);
-
-                if got_bits == 0 {
+    /// Capture a specific monitor using our direct DXGI implementation
+    /// position: (x, y) coordinates in virtual screen space - the authoritative monitor identifier
+    fn capture_desktop_frame(&mut self, position: (i32, i32)) -> Option<(Vec<u8>, u32, u32)> {
+        // Initialize DXGI manager if needed
+        if self.dxgi_manager.is_none() {
+            eprintln!("[DXGI] Initializing direct DXGI capture manager...");
+            match DxgiCaptureManager::new() {
+                Ok(manager) => {
+                    self.dxgi_manager = Some(manager);
+                    eprintln!("[DXGI] Manager initialized successfully");
+                }
+                Err(e) => {
+                    eprintln!("[DXGI] Failed to create DXGI manager: {:?}", e);
                     return None;
                 }
-
-                self.preview_frame_count += 1;
-
-                return Some((buffer, width, height));
             }
-
-            // Cleanup on failure
-            let _ = SelectObject(mem_dc, old_bitmap);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(mem_dc);
-            let _ = ReleaseDC(hwnd, hdc);
-
-            return None;
         }
+
+        let manager = self.dxgi_manager.as_mut().unwrap();
+
+        // Enumerate outputs on first capture
+        if !manager.has_output_at_position(position.0, position.1) {
+            eprintln!("[DXGI] Enumerating all outputs...");
+            match manager.enumerate_outputs() {
+                Ok(outputs) => {
+                    eprintln!("[DXGI] Found {} outputs total", outputs.len());
+                }
+                Err(e) => {
+                    eprintln!("[DXGI] Enumeration failed: {:?}", e);
+                    return None;
+                }
+            }
+        }
+
+        // Capture with DXGI - returns None on timeout (normal)
+        manager
+            .capture_frame(position)
+            .ok()
+            .map(|frame| (frame.data, frame.width, frame.height))
     }
 
-    /// Capture a specific monitor using hybrid DXGI (primary) + GDI (fallback)
-    /// monitor_index: 0 = primary, 1+ = secondary monitors
-    fn capture_desktop_frame(&mut self, monitor_index: u32) -> Option<(Vec<u8>, u32, u32)> {
-        // Try DXGI first (GPU-accelerated)
-        if !self.dxgi_failed_monitors.contains(&monitor_index) {
-            // Get or create DXGIManager for this monitor
-            let manager = match self.dxgi_capture.entry(monitor_index) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    eprintln!(
-                        "[DX11] Creating DXGI Desktop Duplication for monitor {}",
-                        monitor_index
-                    );
-                    match dxgi_capture_rs::DXGIManager::new(16) {
-                        Ok(mut mgr) => {
-                            let (w, h) = mgr.geometry();
-                            eprintln!("[DX11] DXGI initialized - geometry: {}x{}", w, h);
-                            entry.insert(mgr)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[DX11] Failed to create DXGIManager for monitor {}: {:?}. \
-                                 Falling back to GDI capture for this monitor.",
-                                monitor_index, e
-                            );
-                            // Cache this failure so we don't retry every frame
-                            self.dxgi_failed_monitors.insert(monitor_index);
-                            return self.capture_desktop_frame_gdi(monitor_index);
-                        }
+    /// Send an already-captured frame to the recording pipeline
+    /// This reuses the preview capture frame - no double capture needed
+    fn send_frame_to_recording(&mut self, rgba_data: &[u8], width: u32, height: u32) {
+        // Rate limit to target FPS
+        let target_frame_interval = std::time::Duration::from_secs_f32(1.0 / self.fps_setting);
+        static mut LAST_RECORDING_FRAME: Option<std::time::Instant> = None;
+
+        let now = std::time::Instant::now();
+        let last = unsafe { LAST_RECORDING_FRAME };
+        if let Some(last_time) = last {
+            if now.duration_since(last_time) < target_frame_interval {
+                return; // Skip this frame - not enough time elapsed
+            }
+        }
+        unsafe {
+            LAST_RECORDING_FRAME = Some(now);
+        }
+
+        static mut FRAME_COUNT: u64 = 0;
+
+        let out_w = self.output_width;
+        let out_h = self.output_height;
+
+        // Scale on main thread BEFORE sending to reduce memory pressure
+        // 4K (33MB) → 1080p (8.3MB) = 75% reduction per frame
+        let scaled_data = if width != out_w || height != out_h {
+            self.scale_frame_to_output(rgba_data, width, height, out_w, out_h)
+        } else {
+            rgba_data.to_vec()
+        };
+
+        // Convert RGBA to BGRA for FFmpeg
+        let mut bgra_data = scaled_data;
+        for chunk in bgra_data.chunks_exact_mut(4) {
+            chunk.swap(0, 2); // RGBA -> BGRA
+        }
+
+        // Send to FFmpeg writer thread
+        if let Some(ref tx) = self.recording_frame_sender {
+            match tx.send(bgra_data) {
+                Ok(_) => {
+                    unsafe {
+                        FRAME_COUNT += 1;
                     }
-                }
-            };
-
-            // Set the capture source to the correct monitor
-            manager.set_capture_source_index(monitor_index as usize);
-
-            // Capture frame via DXGI
-            match manager.capture_frame_components() {
-                Ok((data, (width, height))) => {
-                    return Some((data, width as u32, height as u32));
-                }
-                Err(dxgi_capture_rs::CaptureError::Timeout) => {
-                    return None;
-                }
-                Err(dxgi_capture_rs::CaptureError::AccessLost) => {
-                    eprintln!(
-                        "[DX11] Access lost for monitor {}, recreating manager",
-                        monitor_index
-                    );
-                    self.dxgi_capture.remove(&monitor_index);
-                    // Retry once on next call
-                    return None;
+                    if unsafe { FRAME_COUNT } % 30 == 0 {
+                        eprintln!(
+                            "[DXGI-Record] Sent {} frames to FFmpeg ({}x{})",
+                            unsafe { FRAME_COUNT },
+                            out_w,
+                            out_h
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!(
-                        "[DX11] Capture error for monitor {}: {:?}. Falling back to GDI.",
-                        monitor_index, e
+                        "[DXGI-Record] Channel send failed: {}, stopping recording",
+                        e
                     );
-                    // Don't remove - might be transient
-                    // Fall through to GDI
+                    self.stop_recording();
                 }
             }
-        }
-
-        // GDI fallback
-        self.capture_desktop_frame_gdi(monitor_index)
-    }
-
-    /// Fallback: capture monitor using GDI BitBlt
-    fn capture_desktop_frame_gdi(&self, monitor_index: u32) -> Option<(Vec<u8>, u32, u32)> {
-        let monitors = get_monitors();
-        let monitor = monitors.get(monitor_index as usize)?;
-
-        eprintln!(
-            "[GDI] Capturing monitor {} ({}x{} at {},{})",
-            monitor_index, monitor.width, monitor.height, monitor.position_x, monitor.position_y
-        );
-
-        unsafe {
-            let hdc_screen = GetDC(HWND(std::ptr::null_mut()));
-            if hdc_screen.is_invalid() {
-                return None;
-            }
-
-            let cap_w = monitor.width as i32;
-            let cap_h = monitor.height as i32;
-            let cap_x = monitor.position_x;
-            let cap_y = monitor.position_y;
-
-            if cap_w <= 0 || cap_h <= 0 {
-                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
-                return None;
-            }
-
-            let mem_dc = CreateCompatibleDC(hdc_screen);
-            let bitmap = CreateCompatibleBitmap(hdc_screen, cap_w, cap_h);
-            let old_bitmap = SelectObject(mem_dc, bitmap);
-
-            let bitblt_ok = BitBlt(
-                mem_dc,
-                0,
-                0,
-                cap_w,
-                cap_h,
-                hdc_screen,
-                cap_x,
-                cap_y,
-                SRCCOPY | CAPTUREBLT,
-            );
-
-            if bitblt_ok.is_ok() {
-                let mut bmi = BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: cap_w,
-                    biHeight: -(cap_h), // Top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                };
-
-                let width = cap_w as u32;
-                let height = cap_h as u32;
-                let mut buffer = vec![0u8; (width * height * 4) as usize];
-                let got_bits = GetDIBits(
-                    mem_dc,
-                    bitmap,
-                    0,
-                    height,
-                    Some(buffer.as_mut_ptr() as *mut _),
-                    &mut bmi as *mut _ as *mut BITMAPINFO,
-                    DIB_RGB_COLORS,
-                );
-
-                let _ = SelectObject(mem_dc, old_bitmap);
-                let _ = DeleteObject(bitmap);
-                let _ = DeleteDC(mem_dc);
-                let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
-
-                if got_bits != 0 {
-                    return Some((buffer, width, height));
-                }
-            }
-
-            let _ = SelectObject(mem_dc, old_bitmap);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(mem_dc);
-            let _ = ReleaseDC(HWND(std::ptr::null_mut()), hdc_screen);
-            None
         }
     }
 
     fn process_preview_frames(&mut self, ctx: &egui::Context) {
-        // Get output resolution (the resolution we're streaming/recording at)
-        let output_width = self.output_width;
-        let output_height = self.output_height;
+        // Limit preview capture to target FPS to avoid excessive CPU usage
+        // from BGRA->RGBA conversion and texture upload
+        let target_frame_interval = std::time::Duration::from_secs_f32(1.0 / self.fps_setting);
+        if self.last_preview_capture.elapsed() < target_frame_interval {
+            return;
+        }
+        self.last_preview_capture = std::time::Instant::now();
 
         // Collect all visible capture source items first to avoid borrow issues
         let scene = self.scenes.current_scene();
@@ -1242,7 +1138,6 @@ impl RobsApp {
             // No capture sources - stop preview
             if self.preview_capture_active {
                 self.preview_capture_active = false;
-                self.preview_hwnd = None;
                 eprintln!("[Preview] No capture sources, stopping preview");
             }
             return;
@@ -1262,36 +1157,47 @@ impl RobsApp {
                     "[Preview] Window capture preview pending (HWND not stored in scene item)"
                 );
             } else if item_name.starts_with("Display Capture") {
-                // Display capture - parse monitor index from source name
+                // Display capture - parse monitor info from source name
                 // Format: "Display Capture - Name|idx:X|x:Y|y:Z|w:W|h:H"
-                let monitor_index = parse_monitor_index(item_name);
+                // NOTE: idx is no longer used for capture - position (x,y) is the authoritative identifier
+                let (mon_x, mon_y, mon_w, mon_h) = parse_monitor_coords(item_name);
+                let position = (mon_x, mon_y);
 
-                if let Some((data, width, height)) = self.capture_desktop_frame(monitor_index) {
-                    // Scale to output resolution
-                    let scaled_data = self.scale_frame_to_output(
-                        &data,
-                        width,
-                        height,
-                        output_width,
-                        output_height,
-                    );
+                eprintln!(
+                    "[Preview] Capturing Display Capture at position ({}, {}) - {}x{}",
+                    mon_x, mon_y, mon_w, mon_h
+                );
 
-                    let mut rgba_data = scaled_data.clone();
+                // Pure DX11 capture - no GDI fallback
+                if let Some((data, width, height)) = self.capture_desktop_frame(position) {
+                    // Convert BGRA to RGBA (only once - DXGI returns BGRA)
+                    let mut rgba_data = data;
                     for chunk in rgba_data.chunks_exact_mut(4) {
                         chunk.swap(0, 2); // BGRA -> RGBA
                     }
 
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                        [output_width as usize, output_height as usize],
+                        [width as usize, height as usize],
                         &rgba_data,
                     );
 
-                    let texture = ctx.load_texture(
-                        format!("preview_{}", texture_key.0 .0),
-                        color_image,
-                        egui::TextureOptions::default(),
-                    );
-                    self.preview_textures.insert(texture_key, texture);
+                    // Reuse existing texture or create new one
+                    if let Some(texture) = self.preview_textures.get_mut(&texture_key) {
+                        texture.set(color_image, egui::TextureOptions::LINEAR);
+                    } else {
+                        let texture = ctx.load_texture(
+                            format!("preview_{:?}", texture_key),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.preview_textures.insert(texture_key, texture);
+                    }
+
+                    // RECORDING: Reuse the captured frame for recording
+                    // This eliminates double capture - recording taps into the same frame preview uses
+                    if self.recording && self.recording_frame_sender.is_some() {
+                        self.send_frame_to_recording(&rgba_data, width, height);
+                    }
                 }
             }
         }
@@ -1573,14 +1479,28 @@ impl RobsApp {
         ui.heading("Video");
         ui.separator();
         egui::Grid::new("settings_video").show(ui, |ui| {
-            ui.label("Base Resolution:");
-            ui.label(format!("{}x{}", self.base_width, self.base_height));
+            ui.label("Base Resolution (Canvas):");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.base_width)
+                        .range(640..=7680)
+                        .suffix(" x"),
+                );
+                ui.add(egui::DragValue::new(&mut self.base_height).range(480..=4320));
+            });
             ui.end_row();
-            ui.label("Output Resolution:");
-            ui.label(format!("{}x{}", self.output_width, self.output_height));
+            ui.label("Output (Scaled) Resolution:");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.output_width)
+                        .range(640..=7680)
+                        .suffix(" x"),
+                );
+                ui.add(egui::DragValue::new(&mut self.output_height).range(480..=4320));
+            });
             ui.end_row();
             ui.label("Downscale Filter:");
-            ui.button("Bilinear");
+            ui.button("Lanczos");
             ui.end_row();
             ui.label("FPS Type:");
             ui.button("Integer");
@@ -1589,6 +1509,8 @@ impl RobsApp {
             ui.add(egui::Slider::new(&mut self.fps_setting, 1.0..=120.0));
             ui.end_row();
         });
+        ui.separator();
+        ui.label(egui::RichText::new("Note: Base Resolution is your capture canvas size. Output Resolution is what gets encoded.").small().weak());
     }
 
     fn settings_audio(&mut self, ui: &mut egui::Ui) {
@@ -2616,7 +2538,7 @@ impl eframe::App for RobsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
 
-        // Process preview frames
+        // Process preview frames (recording now hooks into this - no separate capture needed)
         self.process_preview_frames(ctx);
 
         // Manage preview capture based on source visibility
